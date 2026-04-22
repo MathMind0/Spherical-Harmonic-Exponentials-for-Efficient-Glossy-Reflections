@@ -108,6 +108,7 @@ struct FDemoRoot
 	int LastIBLMode;
 	int MaterialMode;
 	int IBLMode;
+	uint32_t NumSamples;
 	float SHEBias;
 	uint32_t NumFrames;
 };
@@ -301,6 +302,21 @@ static void Draw(FDemoRoot &Root)
 		}
 	}
 
+	// Copy color buffer to accumulation buffer.
+	{
+		CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(Root.AccumulationBuffer, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)));
+		CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(Root.MSColorBuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)));
+		
+		if (Root.NumSamples > 1)
+			CmdList->ResolveSubresource(Root.AccumulationBuffer, 0, Root.MSColorBuffer, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+		else
+			CmdList->CopyResource(Root.AccumulationBuffer, Root.MSColorBuffer);
+		
+
+		CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(Root.AccumulationBuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)));
+		CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(Root.MSColorBuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET)));
+	}
+
 	// Draw EnvMap.
 	{
 		CmdList->SetPipelineState(Root.Pipelines[PSO_SampleEnvMap]);
@@ -322,15 +338,6 @@ static void Draw(FDemoRoot &Root)
 		CmdList->DrawIndexedInstanced(Mesh.IndexCount, 1, Mesh.StartIndexLocation, Mesh.BaseVertexLocation, 0);
 	}
 
-	// Copy color buffer to accumulation buffer.
-	{
-		CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(Root.AccumulationBuffer, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)));
-		CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(Root.MSColorBuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)));
-		CmdList->ResolveSubresource(Root.AccumulationBuffer, 0, Root.MSColorBuffer, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
-		CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(Root.AccumulationBuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)));
-		CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(Root.MSColorBuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET)));
-	}
-
 	DrawUI(Gfx, Root.UI);
 
 	// Resolve MS color buffer and copy it to back buffer.
@@ -345,7 +352,10 @@ static void Draw(FDemoRoot &Root)
 				CD3DX12_RESOURCE_BARRIER::Transition(Root.MSColorBuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE)};
 		CmdList->ResourceBarrier((UINT)eastl::size(Barriers), Barriers);
 
-		CmdList->ResolveSubresource(BackBuffer, 0, Root.MSColorBuffer, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+		if (Root.NumSamples > 1)
+			CmdList->ResolveSubresource(BackBuffer, 0, Root.MSColorBuffer, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+		else
+			CmdList->CopyResource(BackBuffer, Root.MSColorBuffer);
 
 		eastl::swap(Barriers[0].Transition.StateBefore, Barriers[0].Transition.StateAfter);
 		eastl::swap(Barriers[1].Transition.StateBefore, Barriers[1].Transition.StateAfter);
@@ -458,7 +468,7 @@ static void CreatePipelines(FGraphicsContext &Gfx, uint32_t NumSamples, eastl::v
 		PSODesc.NumRenderTargets = 1;
 		PSODesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
 		PSODesc.SampleMask = UINT32_MAX;
-		PSODesc.SampleDesc.Count = 8;
+		PSODesc.SampleDesc.Count = NumSamples;
 		EA_ASSERT(OutPipelines.size() == PSO_SampleEnvMap);
 		AddGraphicsPipeline(Gfx, PSODesc, "SampleEnvMap.vs.cso", "SampleEnvMap.ps.cso", OutPipelines, OutSignatures);
 	}
@@ -1191,9 +1201,9 @@ static void Initialize(FDemoRoot &Root)
 	eastl::vector<ID3D12Resource *> TempResources;
 	eastl::vector<ID3D12Resource *> TexturesThatNeedMipmaps;
 
-	const uint32_t NumSamples = 8;
-	CreateUIContext(Gfx, NumSamples, Root.UI, TempResources);
-	CreatePipelines(Gfx, NumSamples, Root.Pipelines, Root.RootSignatures);
+	Root.NumSamples = 1;
+	CreateUIContext(Gfx, Root.NumSamples, Root.UI, TempResources);
+	CreatePipelines(Gfx, Root.NumSamples, Root.Pipelines, Root.RootSignatures);
 
 	eastl::vector<FVertex> AllVertices;
 	eastl::vector<uint32_t> AllIndices;
@@ -1316,11 +1326,11 @@ static void Initialize(FDemoRoot &Root)
 
 	// Setup resources for MSAA.
 	{
-		CD3DX12_RESOURCE_DESC DescColor = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R8G8B8A8_UNORM, Gfx.Resolution[0], Gfx.Resolution[1], 1, 1, NumSamples);
+		CD3DX12_RESOURCE_DESC DescColor = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R8G8B8A8_UNORM, Gfx.Resolution[0], Gfx.Resolution[1], 1, 1, Root.NumSamples);
 		DescColor.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 		VHR(Gfx.Device->CreateCommittedResource(get_rvalue_ptr(CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT)), D3D12_HEAP_FLAG_NONE, &DescColor, D3D12_RESOURCE_STATE_RENDER_TARGET, get_rvalue_ptr(CD3DX12_CLEAR_VALUE(DXGI_FORMAT_R8G8B8A8_UNORM, XMVECTORF32{0.0f})), IID_PPV_ARGS(&Root.MSColorBuffer)));
 
-		CD3DX12_RESOURCE_DESC DescDepth = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_D32_FLOAT, Gfx.Resolution[0], Gfx.Resolution[1], 1, 1, NumSamples);
+		CD3DX12_RESOURCE_DESC DescDepth = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_D32_FLOAT, Gfx.Resolution[0], Gfx.Resolution[1], 1, 1, Root.NumSamples);
 		DescDepth.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
 		VHR(Gfx.Device->CreateCommittedResource(get_rvalue_ptr(CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT)), D3D12_HEAP_FLAG_NONE, &DescDepth, D3D12_RESOURCE_STATE_DEPTH_WRITE, get_rvalue_ptr(CD3DX12_CLEAR_VALUE(DXGI_FORMAT_D32_FLOAT, 1.0f, 0)), IID_PPV_ARGS(&Root.MSDepthBuffer)));
 
