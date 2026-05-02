@@ -11,6 +11,18 @@
 
 #define MESH_MAX_NUM_SECTIONS 4
 
+static const char *GEnvironmentMapNames[] =
+{
+	"Qwantani Sunset Puresky",
+	"Newport Loft",
+};
+
+static const char *GEnvironmentMapPaths[] =
+{
+	"Data/Textures/qwantani_sunset_puresky_4k.hdr",
+	"Data/Textures/Newport_Loft.hdr",
+};
+
 enum
 {
 	MESH_Cube,
@@ -30,6 +42,7 @@ enum
 	PSO_SHE_Reduction,
 	PSO_SHE_Reduction_Merge,
 	PSO_SHE_Solve,
+	PSO_SHE_Calibrate,
 };
 
 struct FVertex
@@ -98,7 +111,7 @@ struct FDemoRoot
 	D3D12_CPU_DESCRIPTOR_HANDLE SHEMatrixASRV;
 	D3D12_CPU_DESCRIPTOR_HANDLE SHEMatrixbSRV;
 	D3D12_CPU_DESCRIPTOR_HANDLE SHEMatrixATSRV;
-	D3D12_CPU_DESCRIPTOR_HANDLE SHESHCoeffSRV;
+	D3D12_CPU_DESCRIPTOR_HANDLE SHESHCoeffCBV;
 	ID3D12Resource *MSColorBuffer;
 	ID3D12Resource *MSDepthBuffer;
 	ID3D12Resource *AccumulationBuffer;
@@ -108,10 +121,14 @@ struct FDemoRoot
 	int LastIBLMode;
 	int MaterialMode;
 	int IBLMode;
+	int EnvironmentMapIndex;
+	int SelectedEnvironmentMapIndex;
+	int PendingEnvironmentMapIndex;
 	uint32_t NumSamples;
-	float SHEBias;
 	uint32_t NumFrames;
 };
+
+static void RebuildEnvironment(FDemoRoot &Root);
 
 static void UpdateUI(FDemoRoot &Root, float DeltaTime)
 {
@@ -141,10 +158,13 @@ static void UpdateUI(FDemoRoot &Root, float DeltaTime)
 	}
 
 	{
-		if (Root.IBLMode == IBL_MODE_SPHERICAL_HARMONICS_EXPONENTIAL)
+		ImGui::Text("Environment");
+		if (ImGui::Combo("##Environment", &Root.SelectedEnvironmentMapIndex, GEnvironmentMapNames, IM_ARRAYSIZE(GEnvironmentMapNames)))
 		{
-			ImGui::Text("SHE Bias");
-			ImGui::SliderFloat("##SHEBias", &Root.SHEBias, 0.0f, 10.0f);
+			if (Root.SelectedEnvironmentMapIndex != Root.EnvironmentMapIndex)
+			{
+				Root.PendingEnvironmentMapIndex = Root.SelectedEnvironmentMapIndex;
+			}
 		}
 	}
 
@@ -157,6 +177,11 @@ static void Update(FDemoRoot &Root)
 	float DeltaTime;
 	UpdateFrameStats(Root.Gfx.Window, "ImageBasedPBR", Time, DeltaTime, Root.NumFrames);
 	UpdateUI(Root, DeltaTime);
+
+	if (Root.PendingEnvironmentMapIndex >= 0)
+	{
+		RebuildEnvironment(Root);
+	}
 
 	// Update camera position.
 	//{
@@ -235,7 +260,6 @@ static void Draw(FDemoRoot &Root)
 			CPUAddress->MaterialMode = Root.MaterialMode;
 			CPUAddress->IBLMode = Root.IBLMode;
 			CPUAddress->NumFrames = Root.NumFrames;
-			CPUAddress->SHEBias = Root.SHEBias;
 
 			CD3DX12_CPU_DESCRIPTOR_HANDLE TableBaseCPU;
 			CD3DX12_GPU_DESCRIPTOR_HANDLE TableBaseGPU;
@@ -246,6 +270,9 @@ static void Draw(FDemoRoot &Root)
 			CBVDesc.SizeInBytes = (uint32_t)sizeof(FPerFrameConstantData);
 
 			Gfx.Device->CreateConstantBufferView(&CBVDesc, TableBaseCPU);
+			TableBaseCPU.Offset(Gfx.DescriptorSize);
+
+			Gfx.Device->CopyDescriptorsSimple(1, TableBaseCPU, Root.SHESHCoeffCBV, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 			TableBaseCPU.Offset(Gfx.DescriptorSize);
 
 			Gfx.Device->CopyDescriptorsSimple(1, TableBaseCPU, Root.IrradianceMapSRV, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -261,9 +288,6 @@ static void Draw(FDemoRoot &Root)
 			TableBaseCPU.Offset(Gfx.DescriptorSize);
 
 			Gfx.Device->CopyDescriptorsSimple(1, TableBaseCPU, Root.AccumulationBufferSRV, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-			TableBaseCPU.Offset(Gfx.DescriptorSize);
-
-			Gfx.Device->CopyDescriptorsSimple(1, TableBaseCPU, Root.SHESHCoeffSRV, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 			TableBaseCPU.Offset(Gfx.DescriptorSize);
 
 			CmdList->SetGraphicsRootDescriptorTable(1, TableBaseGPU);
@@ -517,15 +541,17 @@ static void CreatePipelines(FGraphicsContext &Gfx, uint32_t NumSamples, eastl::v
 
 	EA_ASSERT(OutPipelines.size() == PSO_SHE_Solve);
 	AddComputePipeline(Gfx, "SHE_Solve.cs.cso", OutPipelines, OutSignatures);
+
+	EA_ASSERT(OutPipelines.size() == PSO_SHE_Calibrate);
+	AddComputePipeline(Gfx, "SHE_Calibrate.cs.cso", OutPipelines, OutSignatures);
 }
 
-static void CreateEnvMap(FGraphicsContext &Gfx, const FStaticMesh &Cube, ID3D12Resource *&OutEnvMap, D3D12_CPU_DESCRIPTOR_HANDLE &OutEnvMapSRV, eastl::vector<ID3D12Resource *> &OutTempResources)
+static void CreateEnvMap(FGraphicsContext &Gfx, const FStaticMesh &Cube, const char *EnvironmentMapPath, ID3D12Resource *&OutEnvMap, D3D12_CPU_DESCRIPTOR_HANDLE &OutEnvMapSRV, eastl::vector<ID3D12Resource *> &OutTempResources)
 {
 	int Width, Height;
 	D3D12_SUBRESOURCE_DATA ImageData = {};
 	stbi_set_flip_vertically_on_load(1);
-	ImageData.pData = stbi_loadf("Data/Textures/qwantani_sunset_puresky_4k.hdr", &Width, &Height, nullptr, 3);
-	//ImageData.pData = stbi_loadf("Data/Textures/Newport_Loft.hdr", &Width, &Height, nullptr, 3);
+	ImageData.pData = stbi_loadf(EnvironmentMapPath, &Width, &Height, nullptr, 3);
 	stbi_set_flip_vertically_on_load(0);
 	ImageData.RowPitch = Width * sizeof(XMFLOAT3);
 	EA_ASSERT(ImageData.pData);
@@ -1031,27 +1057,24 @@ static void SHEReduction(FDemoRoot &Root, FGraphicsContext &Gfx, ID3D12Resource 
 	}
 }
 
-static void SHESolve(FGraphicsContext &Gfx, ID3D12Resource *&OutSHESHCoeff, D3D12_CPU_DESCRIPTOR_HANDLE &OutSHESHCoeffSRV, D3D12_CPU_DESCRIPTOR_HANDLE SHEMatrixAT)
+static void SHESolve(FGraphicsContext &Gfx, ID3D12Resource *&OutSHESHCoeff, D3D12_CPU_DESCRIPTOR_HANDLE &OutSHESHCoeffCBV, D3D12_CPU_DESCRIPTOR_HANDLE SHEMatrixAT)
 {
 	const D3D12_CPU_DESCRIPTOR_HANDLE TempSHESHCoeffUAV = AllocateDescriptors(Gfx, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
 	{
-		auto Desc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(XMFLOAT3) * 33, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+		auto Desc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(FSHECoefficientConstantData), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
 		VHR(Gfx.Device->CreateCommittedResource(get_rvalue_ptr(CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT)), D3D12_HEAP_FLAG_NONE, &Desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&OutSHESHCoeff)));
 		D3D12_UNORDERED_ACCESS_VIEW_DESC UAVDesc = {};
 		UAVDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-		UAVDesc.Buffer.NumElements = 33;
-		UAVDesc.Buffer.StructureByteStride = sizeof(XMFLOAT3);
+		UAVDesc.Buffer.NumElements = 34;
+		UAVDesc.Buffer.StructureByteStride = sizeof(XMFLOAT4);
 		UAVDesc.Format = DXGI_FORMAT_UNKNOWN;
 		Gfx.Device->CreateUnorderedAccessView(OutSHESHCoeff, nullptr, &UAVDesc, TempSHESHCoeffUAV);
 
-		OutSHESHCoeffSRV = AllocateDescriptors(Gfx, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
-		D3D12_SHADER_RESOURCE_VIEW_DESC SRVDesc = {};
-		SRVDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-		SRVDesc.Buffer.NumElements = 33;
-		SRVDesc.Buffer.StructureByteStride = sizeof(XMFLOAT3);
-		SRVDesc.Format = DXGI_FORMAT_UNKNOWN;
-		SRVDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-		Gfx.Device->CreateShaderResourceView(OutSHESHCoeff, &SRVDesc, OutSHESHCoeffSRV);
+		OutSHESHCoeffCBV = AllocateDescriptors(Gfx, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
+		D3D12_CONSTANT_BUFFER_VIEW_DESC CBVDesc = {};
+		CBVDesc.BufferLocation = OutSHESHCoeff->GetGPUVirtualAddress();
+		CBVDesc.SizeInBytes = sizeof(FSHECoefficientConstantData);
+		Gfx.Device->CreateConstantBufferView(&CBVDesc, OutSHESHCoeffCBV);
 	}
 
 	ID3D12GraphicsCommandList2 *CmdList = Gfx.CmdList;
@@ -1068,9 +1091,181 @@ static void SHESolve(FGraphicsContext &Gfx, ID3D12Resource *&OutSHESHCoeff, D3D1
 
 	CmdList->SetComputeRootDescriptorTable(0, TableBaseGPU);
 	CmdList->Dispatch(1, 1, 1);
+}
+
+static void SHECalibrate(FGraphicsContext &Gfx, ID3D12Resource *SHESHCoeff, D3D12_CPU_DESCRIPTOR_HANDLE SHEMatrixASRV, D3D12_CPU_DESCRIPTOR_HANDLE SHEMatrixbSRV)
+{
+	const uint32_t ViewCountSqrt = 8;
+	const uint32_t NormalCountSqrt = 8;
+	const uint32_t ViewCount = ViewCountSqrt * ViewCountSqrt;
+	const uint32_t NormalCount = NormalCountSqrt * NormalCountSqrt;
+	const uint32_t RoughnessCount = 4;
+	const uint32_t SphericalHarmonicCount = 33;
+
+	const D3D12_CPU_DESCRIPTOR_HANDLE TempSHESHCoeffUAV = AllocateDescriptors(Gfx, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
+	{
+		D3D12_UNORDERED_ACCESS_VIEW_DESC UAVDesc = {};
+		UAVDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+		UAVDesc.Buffer.NumElements = 34;
+		UAVDesc.Buffer.StructureByteStride = sizeof(XMFLOAT4);
+		UAVDesc.Format = DXGI_FORMAT_UNKNOWN;
+		Gfx.Device->CreateUnorderedAccessView(SHESHCoeff, nullptr, &UAVDesc, TempSHESHCoeffUAV);
+	}
+
+	ID3D12GraphicsCommandList2 *CmdList = Gfx.CmdList;
+
+	CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::UAV(SHESHCoeff)));
+
+	D3D12_GPU_VIRTUAL_ADDRESS GPUAddress;
+	auto *CPUAddress = (FSHEReductionConstantData *)AllocateGPUMemory(Gfx, sizeof(FSHEReductionConstantData), GPUAddress);
+
+	CPUAddress->ViewCount = ViewCount;
+	CPUAddress->ElementCount = ViewCount * NormalCount * RoughnessCount;
+	CPUAddress->GroupCountZ = 1;
+	CPUAddress->SphericalHarmonicCount = SphericalHarmonicCount;
+
+	CD3DX12_CPU_DESCRIPTOR_HANDLE TableBaseCPU;
+	CD3DX12_GPU_DESCRIPTOR_HANDLE TableBaseGPU;
+	AllocateGPUDescriptors(Gfx, 4, TableBaseCPU, TableBaseGPU);
+
+	D3D12_CONSTANT_BUFFER_VIEW_DESC CBVDesc = {};
+	CBVDesc.BufferLocation = GPUAddress;
+	CBVDesc.SizeInBytes = sizeof(FSHEReductionConstantData);
+
+	Gfx.Device->CreateConstantBufferView(&CBVDesc, TableBaseCPU);
+	TableBaseCPU.Offset(Gfx.DescriptorSize);
+
+	Gfx.Device->CopyDescriptorsSimple(1, TableBaseCPU, SHEMatrixASRV, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+	TableBaseCPU.Offset(Gfx.DescriptorSize);
+
+	Gfx.Device->CopyDescriptorsSimple(1, TableBaseCPU, SHEMatrixbSRV, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+	TableBaseCPU.Offset(Gfx.DescriptorSize);
+
+	Gfx.Device->CopyDescriptorsSimple(1, TableBaseCPU, TempSHESHCoeffUAV, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+	TableBaseCPU.Offset(Gfx.DescriptorSize);
+
+	CmdList->SetComputeRootDescriptorTable(0, TableBaseGPU);
+	CmdList->Dispatch(1, 1, 1);
 
 	CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(
-									OutSHESHCoeff, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)));
+									SHESHCoeff, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)));
+}
+
+static void ReleaseEnvironmentResources(FDemoRoot &Root)
+{
+	SAFE_RELEASE(Root.EnvMap);
+	SAFE_RELEASE(Root.IrradianceMap);
+	SAFE_RELEASE(Root.PrefilteredEnvMap);
+	SAFE_RELEASE(Root.SHEMatrixA);
+	SAFE_RELEASE(Root.SHEMatrixb);
+	SAFE_RELEASE(Root.SHEMatrixAT);
+	SAFE_RELEASE(Root.SHESHCoeff);
+}
+
+static void RecordEnvironmentPrecomputation(FDemoRoot &Root, eastl::vector<ID3D12Resource *> &TempResources, eastl::vector<ID3D12Resource *> &TexturesThatNeedMipmaps)
+{
+	FGraphicsContext &Gfx = Root.Gfx;
+
+	Gfx.CmdList->IASetVertexBuffers(0, 1, &Root.StaticVBView);
+	Gfx.CmdList->IASetIndexBuffer(&Root.StaticIBView);
+
+	// Create EnvMap.
+	Gfx.CmdList->SetPipelineState(Root.Pipelines[PSO_EquirectangularToCube]);
+	Gfx.CmdList->SetGraphicsRootSignature(Root.RootSignatures[PSO_EquirectangularToCube]);
+	CreateEnvMap(Root.Gfx, Root.StaticMeshes[MESH_Cube], GEnvironmentMapPaths[Root.EnvironmentMapIndex], Root.EnvMap, Root.EnvMapSRV, TempResources);
+	TexturesThatNeedMipmaps.push_back(Root.EnvMap);
+
+	// Create IrradianceMap.
+	Gfx.CmdList->SetPipelineState(Root.Pipelines[PSO_GenerateIrradianceMap]);
+	Gfx.CmdList->SetGraphicsRootSignature(Root.RootSignatures[PSO_GenerateIrradianceMap]);
+	CreateIrradianceMap(Root.Gfx, Root.EnvMapSRV, Root.StaticMeshes[MESH_Cube], Root.IrradianceMap, Root.IrradianceMapSRV, TempResources);
+
+	// SHE Build.
+	Gfx.CmdList->SetPipelineState(Root.Pipelines[PSO_SHE_Build]);
+	Gfx.CmdList->SetComputeRootSignature(Root.RootSignatures[PSO_SHE_Build]);
+	SHEBuild(Gfx, Root.SHEMatrixA, Root.SHEMatrixb, Root.SHEMatrixASRV, Root.SHEMatrixbSRV, Root.EnvMapSRV);
+
+	// SHE Reduction.
+	Gfx.CmdList->SetPipelineState(Root.Pipelines[PSO_SHE_Reduction]);
+	Gfx.CmdList->SetComputeRootSignature(Root.RootSignatures[PSO_SHE_Reduction]);
+	SHEReduction(Root, Gfx, Root.SHEMatrixAT, Root.SHEMatrixATSRV, Root.SHEMatrixASRV, Root.SHEMatrixbSRV, TempResources);
+
+	// SHE Solve.
+	Gfx.CmdList->SetPipelineState(Root.Pipelines[PSO_SHE_Solve]);
+	Gfx.CmdList->SetComputeRootSignature(Root.RootSignatures[PSO_SHE_Solve]);
+	SHESolve(Gfx, Root.SHESHCoeff, Root.SHESHCoeffCBV, Root.SHEMatrixATSRV);
+
+	// SHE log-space brightness calibration.
+	Gfx.CmdList->SetPipelineState(Root.Pipelines[PSO_SHE_Calibrate]);
+	Gfx.CmdList->SetComputeRootSignature(Root.RootSignatures[PSO_SHE_Calibrate]);
+	SHECalibrate(Gfx, Root.SHESHCoeff, Root.SHEMatrixASRV, Root.SHEMatrixbSRV);
+}
+
+static void FinishEnvironmentPrecomputation(FDemoRoot &Root, eastl::vector<ID3D12Resource *> &TempResources, eastl::vector<ID3D12Resource *> &TexturesThatNeedMipmaps)
+{
+	FGraphicsContext &Gfx = Root.Gfx;
+
+	const DXGI_FORMAT Formats[] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM};
+	FMipmapGenerator MipmapGenerators[eastl::size(Formats)];
+	for (uint32_t Idx = 0; Idx < eastl::size(Formats); ++Idx)
+	{
+		CreateMipmapGenerator(Gfx, Formats[Idx], MipmapGenerators[Idx]);
+	}
+
+	for (ID3D12Resource *Texture : TexturesThatNeedMipmaps)
+	{
+		const D3D12_RESOURCE_DESC Desc = Texture->GetDesc();
+
+		for (uint32_t Idx = 0; Idx < eastl::size(Formats); ++Idx)
+		{
+			if (Desc.Format == Formats[Idx])
+			{
+				GenerateMipmaps(Gfx, MipmapGenerators[Idx], Texture);
+				break;
+			}
+		}
+	}
+
+	// Create PrefilteredEnvMap.
+	Gfx.CmdList->SetPipelineState(Root.Pipelines[PSO_PrefilterEnvMap]);
+	Gfx.CmdList->SetGraphicsRootSignature(Root.RootSignatures[PSO_PrefilterEnvMap]);
+	CreatePrefilteredEnvMap(Gfx, Root.EnvMapSRV, Root.StaticMeshes[MESH_Cube], Root.PrefilteredEnvMap, Root.PrefilteredEnvMapSRV, TempResources);
+
+	Gfx.CmdList->Close();
+	Gfx.CmdQueue->ExecuteCommandLists(1, CommandListCast(&Gfx.CmdList));
+	WaitForGPU(Gfx);
+
+	for (ID3D12Resource *Resource : TempResources)
+	{
+		SAFE_RELEASE(Resource);
+	}
+	for (uint32_t Idx = 0; Idx < eastl::size(MipmapGenerators); ++Idx)
+	{
+		DestroyMipmapGenerator(MipmapGenerators[Idx]);
+	}
+}
+
+static void RebuildEnvironment(FDemoRoot &Root)
+{
+	if (Root.PendingEnvironmentMapIndex < 0)
+	{
+		return;
+	}
+
+	WaitForGPU(Root.Gfx);
+	ReleaseEnvironmentResources(Root);
+
+	Root.EnvironmentMapIndex = Root.PendingEnvironmentMapIndex;
+	Root.SelectedEnvironmentMapIndex = Root.EnvironmentMapIndex;
+	Root.PendingEnvironmentMapIndex = -1;
+	Root.NumFrames = 0;
+
+	GetAndInitCommandList(Root.Gfx);
+
+	eastl::vector<ID3D12Resource *> TempResources;
+	eastl::vector<ID3D12Resource *> TexturesThatNeedMipmaps;
+	RecordEnvironmentPrecomputation(Root, TempResources, TexturesThatNeedMipmaps);
+	FinishEnvironmentPrecomputation(Root, TempResources, TexturesThatNeedMipmaps);
 }
 
 static void LoadGLTFMesh(const char *FileName, FMesh &OutMesh, eastl::vector<FVertex> &InOutVertices, eastl::vector<uint32_t> &InOutIndices)
@@ -1299,36 +1494,15 @@ static void Initialize(FDemoRoot &Root)
 	Gfx.CmdList->IASetVertexBuffers(0, 1, &Root.StaticVBView);
 	Gfx.CmdList->IASetIndexBuffer(&Root.StaticIBView);
 
-	// Create EnvMap.
-	Gfx.CmdList->SetPipelineState(Root.Pipelines[PSO_EquirectangularToCube]);
-	Gfx.CmdList->SetGraphicsRootSignature(Root.RootSignatures[PSO_EquirectangularToCube]);
-	CreateEnvMap(Root.Gfx, Root.StaticMeshes[MESH_Cube], Root.EnvMap, Root.EnvMapSRV, TempResources);
-	TexturesThatNeedMipmaps.push_back(Root.EnvMap);
-
-	// Create IrradianceMap.
-	Gfx.CmdList->SetPipelineState(Root.Pipelines[PSO_GenerateIrradianceMap]);
-	Gfx.CmdList->SetGraphicsRootSignature(Root.RootSignatures[PSO_GenerateIrradianceMap]);
-	CreateIrradianceMap(Root.Gfx, Root.EnvMapSRV, Root.StaticMeshes[MESH_Cube], Root.IrradianceMap, Root.IrradianceMapSRV, TempResources);
-
 	// Create BRDFIntegrationMap.
 	Gfx.CmdList->SetPipelineState(Root.Pipelines[PSO_GenerateBRDFIntegrationMap]);
 	Gfx.CmdList->SetComputeRootSignature(Root.RootSignatures[PSO_GenerateBRDFIntegrationMap]);
 	CreateBRDFIntegrationMap(Gfx, Root.BRDFIntegrationMap, Root.BRDFIntegrationMapSRV, TempResources);
 
-	// SHE Build.
-	Gfx.CmdList->SetPipelineState(Root.Pipelines[PSO_SHE_Build]);
-	Gfx.CmdList->SetComputeRootSignature(Root.RootSignatures[PSO_SHE_Build]);
-	SHEBuild(Gfx, Root.SHEMatrixA, Root.SHEMatrixb, Root.SHEMatrixASRV, Root.SHEMatrixbSRV, Root.EnvMapSRV);
+	Root.EnvironmentMapIndex = Root.SelectedEnvironmentMapIndex = 0;
+	Root.PendingEnvironmentMapIndex = -1;
 
-	// SHE Reduction.
-	Gfx.CmdList->SetPipelineState(Root.Pipelines[PSO_SHE_Reduction]);
-	Gfx.CmdList->SetComputeRootSignature(Root.RootSignatures[PSO_SHE_Reduction]);
-	SHEReduction(Root, Gfx, Root.SHEMatrixAT, Root.SHEMatrixATSRV, Root.SHEMatrixASRV, Root.SHEMatrixbSRV, TempResources);
-
-	// SHE Solve.
-	Gfx.CmdList->SetPipelineState(Root.Pipelines[PSO_SHE_Solve]);
-	Gfx.CmdList->SetComputeRootSignature(Root.RootSignatures[PSO_SHE_Solve]);
-	SHESolve(Gfx, Root.SHESHCoeff, Root.SHESHCoeffSRV, Root.SHEMatrixATSRV);
+	RecordEnvironmentPrecomputation(Root, TempResources, TexturesThatNeedMipmaps);
 
 	// Setup resources for MSAA.
 	{
@@ -1367,46 +1541,7 @@ static void Initialize(FDemoRoot &Root)
 	}
 
 	// Execute "data upload" and "data generation" GPU commands, create mipmaps, destroy temp resources when GPU is done.
-	{
-		const DXGI_FORMAT Formats[] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM};
-		FMipmapGenerator MipmapGenerators[eastl::size(Formats)];
-		for (uint32_t Idx = 0; Idx < eastl::size(Formats); ++Idx)
-		{
-			CreateMipmapGenerator(Root.Gfx, Formats[Idx], MipmapGenerators[Idx]);
-		}
-
-		for (ID3D12Resource *Texture : TexturesThatNeedMipmaps)
-		{
-			const D3D12_RESOURCE_DESC Desc = Texture->GetDesc();
-
-			for (uint32_t Idx = 0; Idx < eastl::size(Formats); ++Idx)
-			{
-				if (Desc.Format == Formats[Idx])
-				{
-					GenerateMipmaps(Root.Gfx, MipmapGenerators[Idx], Texture);
-					break;
-				}
-			}
-		}
-
-		// Create PrefilteredEnvMap.
-		Gfx.CmdList->SetPipelineState(Root.Pipelines[PSO_PrefilterEnvMap]);
-		Gfx.CmdList->SetGraphicsRootSignature(Root.RootSignatures[PSO_PrefilterEnvMap]);
-		CreatePrefilteredEnvMap(Gfx, Root.EnvMapSRV, Root.StaticMeshes[MESH_Cube], Root.PrefilteredEnvMap, Root.PrefilteredEnvMapSRV, TempResources);
-
-		Root.Gfx.CmdList->Close();
-		Root.Gfx.CmdQueue->ExecuteCommandLists(1, CommandListCast(&Root.Gfx.CmdList));
-		WaitForGPU(Root.Gfx);
-
-		for (ID3D12Resource *Resource : TempResources)
-		{
-			SAFE_RELEASE(Resource);
-		}
-		for (uint32_t Idx = 0; Idx < eastl::size(MipmapGenerators); ++Idx)
-		{
-			DestroyMipmapGenerator(MipmapGenerators[Idx]);
-		}
-	}
+	FinishEnvironmentPrecomputation(Root, TempResources, TexturesThatNeedMipmaps);
 
 	// Root.CameraPosition = XMFLOAT3(0.0f, 0.0f, -10.0f);
 	Root.CameraPosition = XMFLOAT3(0.0f, 0.0f, 12.0f);
@@ -1415,8 +1550,6 @@ static void Initialize(FDemoRoot &Root)
 	Root.LastIBLMode = Root.IBLMode = IBL_MODE_SPLIT_SUM_APPROXIMATION;
 	Root.LastMaterialMode = Root.MaterialMode = MATERIAL_MODE_SPECULAR_ONLY;
 	Root.NumFrames = 0;
-
-	Root.SHEBias = 1.5f;
 }
 
 static void Shutdown(FDemoRoot &Root)

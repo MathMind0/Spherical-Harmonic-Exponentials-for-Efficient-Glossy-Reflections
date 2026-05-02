@@ -41,7 +41,6 @@ struct SALIGN FPerFrameConstantData
 	int MaterialMode;
 	int IBLMode;
 	uint32_t NumFrames;
-	float SHEBias;
 };
 
 struct SALIGN FSHEBuildConstantData
@@ -60,6 +59,11 @@ struct SALIGN FSHEReductionConstantData
 	int32_t ElementCount;
 	int32_t GroupCountZ;
 	int32_t SphericalHarmonicCount;
+};
+
+struct SALIGN FSHECoefficientConstantData
+{
+	float4 Coeffs[34];
 };
 
 #ifdef __cplusplus

@@ -7,7 +7,7 @@
 
 Texture2D GSHEMatrixAT : register(t0); // float
 
-RWStructuredBuffer<float3> GSHEBuffer : register(u0);
+RWStructuredBuffer<float4> GSHEBuffer : register(u0);
 
 [RootSignature(GRootSignature)]
 [numthreads(1, 1, 1)]
@@ -62,7 +62,7 @@ void MainCS()
             Sum += L[j][i] * x[j];
 
         x[i] = (y[i] - Sum) / max(L[i][i], 1e-8f);
-        GSHEBuffer[i] = x[i];
+        GSHEBuffer[i] = float4(x[i], 0.0f);
     }
 }
 

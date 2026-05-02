@@ -5,7 +5,7 @@
 #define GRootSignature                                                                                                       \
 	"RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT), "                                                                        \
 	"CBV(b0), "                                                                                                              \
-	"DescriptorTable(CBV(b1), SRV(t0), SRV(t1), SRV(t2), SRV(t3), SRV(t4), SRV(t5), visibility = SHADER_VISIBILITY_PIXEL), " \
+	"DescriptorTable(CBV(b1), CBV(b2), SRV(t0), SRV(t1), SRV(t2), SRV(t3), SRV(t4), visibility = SHADER_VISIBILITY_PIXEL), " \
 	"StaticSampler("                                                                                                         \
 	"s0, "                                                                                                                   \
 	"filter = FILTER_MIN_MAG_MIP_LINEAR, "                                                                                   \
@@ -16,12 +16,12 @@
 
 ConstantBuffer<FPerDrawConstantData> GPerDrawCB : register(b0);
 ConstantBuffer<FPerFrameConstantData> GPerFrameCB : register(b1);
+ConstantBuffer<FSHECoefficientConstantData> GSHECoeffCB : register(b2);
 TextureCube GIrradianceMap : register(t0);
 TextureCube GPrefilteredEnvMap : register(t1);
 TextureCube GEnvMap : register(t2);
 Texture2D GBRDFIntegrationMap : register(t3);
 Texture2D GAccumulationBuffer : register(t4);
-StructuredBuffer<float3> GSHESHCoeff : register(t5);
 SamplerState GSampler : register(s0);
 
 float3 FresnelSchlick(float CosTheta, float3 F0)
@@ -131,7 +131,7 @@ float3 FresnelSchlickRoughness(float CosTheta, float3 F0, float Roughness)
 		half3 coeffs[33];
 		for (int i = 0; i < 33; i++)
 		{
-			coeffs[i] = GSHESHCoeff[i];
+			coeffs[i] = GSHECoeffCB.Coeffs[i].rgb;
 		}
 
 		P.R.V0 = half4(coeffs[0].r, coeffs[1].r, coeffs[2].r, coeffs[3].r);
@@ -158,23 +158,23 @@ float3 FresnelSchlickRoughness(float CosTheta, float3 F0, float Roughness)
 		P.B.V5 = half4(coeffs[20].b, coeffs[21].b, coeffs[22].b, coeffs[23].b);
 		P.B.V6 = half(coeffs[24].b);
 
-		Q.R.V0 = half4(coeffs[0].r, coeffs[25].r, coeffs[26].r, coeffs[27].r);
+		half3 autoBias = GSHECoeffCB.Coeffs[33].rgb;
+
+		Q.R.V0 = half4(0.0h, coeffs[25].r, coeffs[26].r, coeffs[27].r);
 		Q.R.V1 = half4(coeffs[28].r, coeffs[29].r, coeffs[30].r, coeffs[31].r);
 		Q.R.V2 = half(coeffs[32].r);
 
-		Q.G.V0 = half4(coeffs[0].g, coeffs[25].g, coeffs[26].g, coeffs[27].g);
+		Q.G.V0 = half4(0.0h, coeffs[25].g, coeffs[26].g, coeffs[27].g);
 		Q.G.V1 = half4(coeffs[28].g, coeffs[29].g, coeffs[30].g, coeffs[31].g);
 		Q.G.V2 = half(coeffs[32].g);
 
-		Q.B.V0 = half4(coeffs[0].b, coeffs[25].b, coeffs[26].b, coeffs[27].b);
+		Q.B.V0 = half4(0.0h, coeffs[25].b, coeffs[26].b, coeffs[27].b);
 		Q.B.V1 = half4(coeffs[28].b, coeffs[29].b, coeffs[30].b, coeffs[31].b);
 		Q.B.V2 = half(coeffs[32].b);
 
-		half3 bias = GPerFrameCB.SHEBias;
-
 		half3 logP = DotSH5(P, yP);
 		half3 logQ = DotSH3(Q, yQ);
-		half3 E0 = exp(logP + logQ + bias);
+		half3 E0 = exp(logP + logQ + autoBias);
 
 		half3 E1 = E0 * GBRDFIntegrationMap.SampleLevel(GSampler, float2(min(NoV, 0.999f), min(Roughness, 0.999f)), 0.0f).g;
 		Specular = F0 * E0 + (1.0f - F0) * E1;

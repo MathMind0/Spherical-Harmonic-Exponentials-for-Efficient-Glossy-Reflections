@@ -1,99 +1,80 @@
-# Spherical Harmonic Exponentials for Efficient Glossy Reflections
+# ImageBasedPBR: Spherical Harmonic Exponentials
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Paper](https://img.shields.io/badge/Paper-DOI%2010.1111%2Fcgf.70219-brightgreen)](https://doi.org/10.1111/cgf.70219)
+Unofficial Direct3D 12 implementation of **Spherical Harmonic Exponentials (SHE)** for glossy image-based lighting, based on:
 
-This repository contains an unofficial implementation of the **Spherical Harmonic Exponentials (SHE)** method for real-time glossy reflections, as presented in the High-Performance Graphics 2025 paper:
-
-> **"Spherical Harmonic Exponentials for Efficient Glossy Reflections"**  
+> **Spherical Harmonic Exponentials for Efficient Glossy Reflections**  
 > A. Silvennoinen, P.-P. Sloan, M. Iwanicki, D. Nowrouzezahrai  
-> *Computer Graphics Forum, Volume 44 (2025), Number 8*
+> Computer Graphics Forum, Volume 44, Number 8, 2025  
+> DOI: <https://doi.org/10.1111/cgf.70219>
 
-![image](/SHE.png)
+![Cover](Results/Cover.png)
 
-## Key Features
+## What This Demo Does
 
-- **200× less memory** than traditional split-sum methods
-- **Alias-free reconstruction** over continuous roughness and angular domains
-- **View-dependent reflections** with higher accuracy
-- **Efficient runtime evaluation** (~0.1ms overhead)
-- Support for **continuously-varying material roughness**
+The renderer compares three IBL paths:
 
-## Build Instructions
+- **Split-Sum**: standard prefiltered environment map + BRDF LUT approximation.
+- **SHE**: fits glossy reflection in log-space with spherical harmonic exponentials.
+- **Reference**: stochastic environment sampling used as the comparison target.
 
-### Compilation
-- Use **Visual Studio 2022** to compile the project
-- Ensure all dependencies are properly configured
-- Build in **Release** mode for optimal performance
+The UI supports switching material mode, IBL mode, and HDRI. Changing the HDRI rebuilds the dependent environment data and SHE coefficients.
 
-### Execution
-- **Do not run the executable directly from the IDE**
-- After compilation, navigate to the working directory
-- Run the `.exe` file directly from the working folder
-- This ensures proper resource loading and path resolution
+## Build And Run
 
-## Implementation Overview
+Requirements:
 
-Our implementation consists of four main compute shaders:
+- Windows
+- Visual Studio 2022
+- Direct3D 12 capable GPU
 
-### 1. `SHE_Build.hlsl`
-- Constructs the linear system (matrix A and vector b)
-- Samples environment maps and computes base reflectance E₀
-- Applies reflection-half-reflection parameterization
-- Uses von Mises-Fisher distribution for roughness encoding
+Build:
 
-### 2. `SHE_Reduction.hlsl`
-- Performs parallel reduction to compute AᵀA and Aᵀb
-- Divides work across multiple thread groups for scalability
-- Handles large matrices efficiently
+```powershell
+& "E:\Visual Studio\MSBuild\Current\Bin\MSBuild.exe" Build\ImageBasedPBR.sln /p:Configuration=Debug /p:Platform=x64
+```
 
-### 3. `SHE_Reduction_Merge.hlsl`
-- Merges partial reduction results from multiple groups
-- Finalizes the AᵀA and Aᵀb matrices
-- Prepares data for linear system solving
+Run the executable from the repository root so relative asset paths resolve correctly:
 
-### 4. `SHE_Solve.hlsl`
-- Solves the linear system using Cholesky decomposition
-- Performs forward and backward substitution
-- Outputs the final spherical harmonic coefficients
+```powershell
+.\ImageBasedPBRDebug.exe
+```
 
-## Implementation Notes & Caveats
+## Implementation
 
-### Technical Implementation Differences
+The SHE precomputation is implemented with compute shaders:
 
-1. **Solving Method Differences**
-   - Original paper uses CUDA for stochastic linear least-squares fitting
-   - This implementation uses Compute Shader for linear system construction and solving
-   - Current matrix solving approach has room for optimization
+- `SHE_Build.hlsl`: samples the environment and builds the fitting system.
+- `SHE_Reduction.hlsl`: reduces samples into partial normal equations.
+- `SHE_Reduction_Merge.hlsl`: merges partial reductions.
+- `SHE_Solve.hlsl`: solves the system with Cholesky decomposition.
+- `SHE_Calibrate.hlsl`: computes a log-space brightness compensation term.
 
-2. **Performance Considerations**
-   - Using StructuredBuffer to store 33 spherical harmonic coefficients (float3 RGB)
-   - Reconstruction requires 33 buffer samples, which is computationally expensive
-   - Using Constant Buffer instead would provide better performance
+Runtime evaluation stores the solved coefficients in a constant buffer. The solve/calibration passes write the same GPU buffer through UAV views, then the forward shader reads it as a CBV.
 
-3. **Precomputation Limitations**
-   - Precomputation is computationally heavy and impractical for real-time environment map updates
-   - Important insight: Matrix A in the original paper is environment-independent
-   - Only vector b needs to be updated when environment maps change
+## Results
 
-### Quality and Practicality Concerns
+Rendered comparisons are stored in `Results/`. Error heatmaps are stored in `Results/Heatmaps/`.
 
-4. **Visual Quality Limitations**
-   - Spherical harmonics suffer from severe band-limiting, especially at low roughness
-   - Current implementation only supports roughness range: 0.4 - 1.0
-   - Original paper notes poor performance below 0.25 roughness, but their roughness mapping may differ
-   - At low roughness, reflections should be sharper, but even reference images in the paper appear blurry
-   - At high roughness, SH lacks high-frequency reflections that Split-Sum preserves
-   - Questionable whether this approach serves the primary use cases of specular reflections
+The table below reports RGB MSE against the reference render. Lower is better.
 
-5. **Brightness Loss Issue**
-   - Significant brightness loss observed when reconstructing with fitted SH coefficients
-   - Same issue found in other reimplementation attempts
-   - Theoretical explanation: Fitting in log-space creates bias due to Jensen's inequality
-   - Mathematical formulation: `𝔼[e^x] ≥ e^{𝔼[x]}` where expectation is taken in log-space
+| Environment | Method | MSE | RMSE | MAE |
+| --- | --- | ---: | ---: | ---: |
+| Sunset | Split-Sum | 0.0008727162 | 0.0295417719 | 0.0129660023 |
+| Sunset | SHE | 0.0005861482 | 0.0242104977 | 0.0099544106 |
+| Loft | Split-Sum | 0.0002726144 | 0.0165110398 | 0.0074861483 |
+| Loft | SHE | 0.0002164342 | 0.0147117032 | 0.0058501605 |
 
-### Final Disclaimer
+![MSE heatmaps](Results/Heatmaps/MSE_heatmap_overview.png)
 
-**This reimplementation has significant limitations and is not suitable for production use in games.** The visual quality struggles to match, let alone surpass, the established Split-Sum approximation in practical scenarios. Several technical challenges remain unresolved, particularly regarding performance, brightness accuracy, and low-roughness representation.
+In these two captures, SHE has lower average error than Split-Sum. The improvement is not uniform: local highlights and low-roughness regions can still expose band-limiting and fitting error.
 
-If you identify any implementation errors or have suggestions for improvement, please feel free to contact me or open an issue. This work represents an experimental exploration rather than a production-ready solution.
+## Current Notes
+
+- The implementation is experimental and meant for studying the paper, not as production renderer code.
+- HDRI switching currently performs synchronous precomputation, so the UI can pause during rebuild.
+- The fitted SHE representation is most fragile around high-frequency lighting and very sharp reflections.
+- Brightness compensation is included because fitting in log-space can bias reconstructed linear radiance.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
