@@ -202,8 +202,12 @@ static void Draw(FDemoRoot &Root)
 
 		Gfx.Device->CreateUnorderedAccessView(Root.AccumulationBuffer, nullptr, &AccumulationBufferUAVDesc, AccumulationBufferUAV);
 
+		CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(Root.AccumulationBuffer, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)));
+
 		float clearColor[4] = {0, 0, 0, 0};
 		CmdList->ClearUnorderedAccessViewFloat(CopyDescriptorsToGPUHeap(Gfx, 1, AccumulationBufferUAV), AccumulationBufferUAV, Root.AccumulationBuffer, clearColor, 0, nullptr);
+
+		CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(Root.AccumulationBuffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)));
 	}
 
 	// Draw all static mesh instances.
@@ -346,10 +350,12 @@ static void Draw(FDemoRoot &Root)
 		D3D12_CPU_DESCRIPTOR_HANDLE BackBufferRTV;
 		GetBackBuffer(Gfx, BackBuffer, BackBufferRTV);
 
+		const D3D12_RESOURCE_STATES BackBufferDestState = Root.NumSamples > 1 ? D3D12_RESOURCE_STATE_RESOLVE_DEST : D3D12_RESOURCE_STATE_COPY_DEST;
+		const D3D12_RESOURCE_STATES ColorBufferSrcState = Root.NumSamples > 1 ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE : D3D12_RESOURCE_STATE_COPY_SOURCE;
 		D3D12_RESOURCE_BARRIER Barriers[2] =
 			{
-				CD3DX12_RESOURCE_BARRIER::Transition(BackBuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RESOLVE_DEST),
-				CD3DX12_RESOURCE_BARRIER::Transition(Root.MSColorBuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE)};
+				CD3DX12_RESOURCE_BARRIER::Transition(BackBuffer, D3D12_RESOURCE_STATE_PRESENT, BackBufferDestState),
+				CD3DX12_RESOURCE_BARRIER::Transition(Root.MSColorBuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, ColorBufferSrcState)};
 		CmdList->ResourceBarrier((UINT)eastl::size(Barriers), Barriers);
 
 		if (Root.NumSamples > 1)
@@ -1429,6 +1435,10 @@ static void Shutdown(FDemoRoot &Root)
 	SAFE_RELEASE(Root.IrradianceMap);
 	SAFE_RELEASE(Root.PrefilteredEnvMap);
 	SAFE_RELEASE(Root.BRDFIntegrationMap);
+	SAFE_RELEASE(Root.SHEMatrixA);
+	SAFE_RELEASE(Root.SHEMatrixb);
+	SAFE_RELEASE(Root.SHEMatrixAT);
+	SAFE_RELEASE(Root.SHESHCoeff);
 	SAFE_RELEASE(Root.MSColorBuffer);
 	SAFE_RELEASE(Root.MSDepthBuffer);
 	SAFE_RELEASE(Root.AccumulationBuffer);

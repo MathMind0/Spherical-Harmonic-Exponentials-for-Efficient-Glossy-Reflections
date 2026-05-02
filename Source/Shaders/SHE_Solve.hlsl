@@ -29,11 +29,11 @@ void MainCS()
             if (i == j)
             {
                 float v = GSHEMatrixAT[uint2(i, i)].r - Sum;
-                L[i][j] = sqrt(v);
+                L[i][j] = sqrt(max(v, 1e-8f));
             }
             else
             {
-                L[i][j] = (GSHEMatrixAT[uint2(i, j)].r - Sum) / L[j][j];
+                L[i][j] = (GSHEMatrixAT[uint2(i, j)].r - Sum) / max(L[j][j], 1e-8f);
             }
         }
     }
@@ -51,7 +51,7 @@ void MainCS()
             GSHEMatrixAT[uint2(i, 35)].r
         );
 
-        y[i] = (ATb_i - Sum) / L[i][i];
+        y[i] = (ATb_i - Sum) / max(L[i][i], 1e-8f);
     }
 
     // Backward substitution
@@ -61,7 +61,7 @@ void MainCS()
         for (int j = i + 1; j < 33; ++j)
             Sum += L[j][i] * x[j];
 
-        x[i] = (y[i] - Sum) / L[i][i];
+        x[i] = (y[i] - Sum) / max(L[i][i], 1e-8f);
         GSHEBuffer[i] = x[i];
     }
 }

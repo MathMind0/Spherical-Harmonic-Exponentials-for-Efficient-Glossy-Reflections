@@ -73,7 +73,7 @@ void MainCS(
     }
 
     E0 /= NumSamples;
-	E0 = log(E0);
+	E0 = log(max(E0, 1e-6f));
 
     // calculate A
     const float3 R = reflect(-V, N);

@@ -89,6 +89,7 @@ void CreateGraphicsContext(HWND Window, bool bShouldCreateDepthBuffer, FGraphics
 
 	Gfx.DescriptorSize = Gfx.Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 	Gfx.DescriptorSizeRTV = Gfx.Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+	Gfx.DescriptorSizeDSV = Gfx.Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
 
 	CreateHeaps(Gfx);
 
@@ -191,7 +192,7 @@ FDescriptorHeap& GetDescriptorHeap(FGraphicsContext& Gfx, D3D12_DESCRIPTOR_HEAP_
 	}
 	else if (Type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV)
 	{
-		OutDescriptorSize = Gfx.DescriptorSizeRTV;
+		OutDescriptorSize = Gfx.DescriptorSizeDSV;
 		return Gfx.DSVHeap;
 	}
 	else if (Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
@@ -594,7 +595,11 @@ void GenerateMipmaps(FGraphicsContext& Gfx, FMipmapGenerator& Generator, ID3D12R
 			CmdList->SetComputeRoot32BitConstant(0, CurrentSrcMipLevel, 0);
 			CmdList->SetComputeRoot32BitConstant(0, NumMipsInDispatch, 1);
 			CmdList->SetComputeRootDescriptorTable(1, GPUHandle);
-			CmdList->Dispatch((UINT)(TextureDesc.Width >> (4 + CurrentSrcMipLevel)), TextureDesc.Height >> (4 + CurrentSrcMipLevel), 1);
+			uint32_t DispatchWidth = (uint32_t)(TextureDesc.Width >> (4 + CurrentSrcMipLevel));
+			uint32_t DispatchHeight = (uint32_t)(TextureDesc.Height >> (4 + CurrentSrcMipLevel));
+			DispatchWidth = DispatchWidth ? DispatchWidth : 1;
+			DispatchHeight = DispatchHeight ? DispatchHeight : 1;
+			CmdList->Dispatch(DispatchWidth, DispatchHeight, 1);
 
 			{
 				const CD3DX12_RESOURCE_BARRIER Barriers[5] =

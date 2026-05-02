@@ -37,6 +37,7 @@ struct FGraphicsContext
 	uint32_t Resolution[2];
 	uint32_t DescriptorSize;
 	uint32_t DescriptorSizeRTV;
+	uint32_t DescriptorSizeDSV;
 	uint32_t FrameIndex;
 	uint32_t BackBufferIndex;
 	IDXGISwapChain3* SwapChain;
