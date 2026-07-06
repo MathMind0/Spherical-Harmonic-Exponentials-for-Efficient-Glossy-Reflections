@@ -24,20 +24,37 @@ The UI supports switching material mode, IBL mode, and HDRI. Changing the HDRI r
 Requirements:
 
 - Windows
-- Visual Studio 2022
+- Visual Studio 2022 with the **Desktop development with C++** workload
 - Direct3D 12 capable GPU
 
-Build:
+Recommended command-line flow:
 
 ```powershell
-& "E:\Visual Studio\MSBuild\Current\Bin\MSBuild.exe" Build\ImageBasedPBR.sln /p:Configuration=Debug /p:Platform=x64
+.\Scripts\build.ps1 -Configuration Debug -Run
 ```
 
-Run the executable from the repository root so relative asset paths resolve correctly:
+This script locates MSBuild automatically, builds `Build\ImageBasedPBR.sln`, and starts the executable with the repository root as the working directory so `Data/...` assets resolve correctly.
+
+Other useful commands:
 
 ```powershell
+.\Scripts\build.ps1 -Configuration Release
+.\Scripts\build.ps1 -Configuration Debug -Clean -Run
 .\ImageBasedPBRDebug.exe
 ```
+
+When running the executable manually, launch it from the repository root:
+
+```powershell
+Set-Location <repo root>
+.\ImageBasedPBRDebug.exe
+```
+
+Visual Studio flow:
+
+1. Open `Build\ImageBasedPBR.sln`.
+2. Select `Debug|x64` or `Release|x64`.
+3. Build or press `F5`. The project sets the debugger working directory to the repository root, so the app can find `Data/...` without launching the `.exe` by hand.
 
 ## Implementation
 
