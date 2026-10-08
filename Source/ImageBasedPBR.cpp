@@ -402,6 +402,55 @@ static void Draw(FDemoRoot &Root)
 			ForwardF.x, ForwardF.y, ForwardF.z, 0.0f,
 			0.0f, 0.0f, 0.0f, 1.0f);
 
+		// Per-column roughness labels: project each column's top anchor (grid
+		// local space, billboarded to face the camera) to screen space and draw
+		// the value with ImGui's background draw list (rendered after the 3D
+		// scene, but behind the ImGui control window).
+		{
+			ImDrawList *LabelDrawList = ImGui::GetBackgroundDrawList();
+			const ImGuiIO &LabelIO = ImGui::GetIO();
+
+			const int32_t NumRows = 6;
+			const int32_t NumColumns = 10;
+			const float CellSize = 2.2f;
+			// Anchor slightly above the top row of spheres.
+			const float LabelY = CellSize * (-NumRows * 0.5f + (NumRows - 1) + 0.5f) + CellSize * 0.65f;
+
+			for (int32_t ColumnIdx = 0; ColumnIdx < NumColumns; ++ColumnIdx)
+			{
+				// Row 0 of each column (instances are laid out row-major).
+				const FStaticMeshInstance &Inst = Root.StaticMeshInstances[ColumnIdx];
+
+				char Label[16];
+				snprintf(Label, sizeof(Label), "%.2f", Inst.Roughness);
+
+				const XMVECTOR AnchorLocal = XMVectorSet(
+					CellSize * (-NumColumns * 0.5f + ColumnIdx + 0.5f), LabelY, 0.0f, 1.0f);
+				const XMVECTOR AnchorWorld = XMVector3Transform(AnchorLocal, Billboard);
+				const XMVECTOR AnchorClip = XMVector3Transform(AnchorWorld, WorldToClip);
+
+				const float NdcX = XMVectorGetX(AnchorClip) / XMVectorGetW(AnchorClip);
+				const float NdcY = XMVectorGetY(AnchorClip) / XMVectorGetW(AnchorClip);
+
+				// Skip labels that fall outside the viewport (e.g. when zoomed in).
+				if (XMVectorGetW(AnchorClip) <= 0.0f || NdcX < -1.1f || NdcX > 1.1f || NdcY < -1.1f || NdcY > 1.1f)
+				{
+					continue;
+				}
+
+				const ImVec2 ScreenPos(
+					(NdcX * 0.5f + 0.5f) * LabelIO.DisplaySize.x,
+					(0.5f - NdcY * 0.5f) * LabelIO.DisplaySize.y);
+
+				const ImVec2 TextSize = ImGui::CalcTextSize(Label);
+				const ImVec2 TextPos(ScreenPos.x - TextSize.x * 0.5f, ScreenPos.y - TextSize.y * 0.5f);
+
+				// Soft black shadow for readability on bright environments.
+				LabelDrawList->AddText(ImVec2(TextPos.x + 1.0f, TextPos.y + 1.0f), IM_COL32(0, 0, 0, 180), Label);
+				LabelDrawList->AddText(TextPos, IM_COL32(255, 255, 255, 255), Label);
+			}
+		}
+
 		for (int32_t GroupIdx = 0; GroupIdx < 3; ++GroupIdx)
 		{
 		const int GroupIBLMode = GIBLModeGroupOrder[GroupIdx];
