@@ -68,7 +68,8 @@ void MainCS(
         {     
             float G = GeometrySmith(NoL, NoV, Roughness);
             float G_Vis = G * VoH / (NoH * NoV + 1e-5);
-            E0 += G_Vis * GEnvMap.SampleLevel(GSampler, L, 0).rgb * NoL;
+            // GGX NDF sampling of H: estimator is Li * G * VoH / (NoH * NoV), no extra NoL.
+            E0 += G_Vis * GEnvMap.SampleLevel(GSampler, L, 0).rgb;
         }
     }
 

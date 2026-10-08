@@ -53,12 +53,14 @@ float3 FresnelSchlickRoughness(float CosTheta, float3 F0, float Roughness)
 		out float4 OutColor : SV_Target0)
 {
 	// Orthographic projection: all view rays are parallel to the camera forward
-	// direction, so V is constant per pixel. Perspective projection: rays converge
-	// at the viewer position.
+	// direction, so V is constant per pixel. ViewDirection points from the focus
+	// (roughly the sphere plane) toward the camera eye, which is exactly the
+	// surface-to-viewer direction V. Perspective projection: rays converge at
+	// the viewer position.
 	float3 V;
 	if (GPerFrameCB.bOrthographic)
 	{
-		V = -normalize(GPerFrameCB.ViewDirection.xyz);
+		V = normalize(GPerFrameCB.ViewDirection.xyz);
 	}
 	else
 	{
@@ -189,6 +191,37 @@ float3 FresnelSchlickRoughness(float CosTheta, float3 F0, float Roughness)
 
 		half3 E1 = E0 * GBRDFIntegrationMap.SampleLevel(GSampler, float2(min(NoV, 0.999f), min(Roughness, 0.999f)), 0.0f).g;
 		Specular = F0 * E0 + (1.0f - F0) * E1;
+
+		// 3-band SH diffuse irradiance (convolved with the clamped cosine
+		// lobe at precompute time, Ramamoorthi 2001). Dot the stored RGB
+		// irradiance coefficients with the SH basis evaluated at N.
+		FThreeBandSHVector yN = SHBasisFunction3(half3(N));
+		FThreeBandSHVectorRGB DiffuseSH;
+		{
+			half3 d0 = GSHECoeffCB.Coeffs[34].rgb;
+			half3 d1 = GSHECoeffCB.Coeffs[35].rgb;
+			half3 d2 = GSHECoeffCB.Coeffs[36].rgb;
+			half3 d3 = GSHECoeffCB.Coeffs[37].rgb;
+			half3 d4 = GSHECoeffCB.Coeffs[38].rgb;
+			half3 d5 = GSHECoeffCB.Coeffs[39].rgb;
+			half3 d6 = GSHECoeffCB.Coeffs[40].rgb;
+			half3 d7 = GSHECoeffCB.Coeffs[41].rgb;
+			half3 d8 = GSHECoeffCB.Coeffs[42].rgb;
+
+			DiffuseSH.R.V0 = half4(d0.r, d1.r, d2.r, d3.r);
+			DiffuseSH.R.V1 = half4(d4.r, d5.r, d6.r, d7.r);
+			DiffuseSH.R.V2 = half(d8.r);
+
+			DiffuseSH.G.V0 = half4(d0.g, d1.g, d2.g, d3.g);
+			DiffuseSH.G.V1 = half4(d4.g, d5.g, d6.g, d7.g);
+			DiffuseSH.G.V2 = half(d8.g);
+
+			DiffuseSH.B.V0 = half4(d0.b, d1.b, d2.b, d3.b);
+			DiffuseSH.B.V1 = half4(d4.b, d5.b, d6.b, d7.b);
+			DiffuseSH.B.V2 = half(d8.b);
+		}
+		Diffuse = DotSH3(DiffuseSH, yN);
+		Diffuse = max(Diffuse, half3(0.0h, 0.0h, 0.0h)) * half3(Albedo * (1.0f / PI));
 	}
 	else if (GPerFrameCB.IBLMode == IBL_MODE_REFERENCE)
 	{
@@ -227,7 +260,10 @@ float3 FresnelSchlickRoughness(float CosTheta, float3 F0, float Roughness)
 				float3 Li = GEnvMap.SampleLevel(GSampler, L, log2(256 * Roughness)).rgb;
 				float G = GeometrySmith(NoL, NoV, Roughness);
 				float G_Vis = G * VoH / (NoH * NoV);
-				Specular += Li * F * G_Vis * NoL;
+				// GGX NDF sampling of H: the estimator is Li * F(VoH) * G * VoH / (NoH * NoV).
+				// The NoL from f_spec * NoL cancels with the pdf; multiplying it back dims the result.
+				float3 FH = FresnelSchlick(VoH, F0);
+				Specular += Li * FH * G_Vis;
 			}
 		}
 

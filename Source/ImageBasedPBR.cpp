@@ -43,6 +43,7 @@ enum
 	PSO_SHE_Reduction_Merge,
 	PSO_SHE_Solve,
 	PSO_SHE_Calibrate,
+	PSO_SHE_Diffuse,
 };
 
 struct FVertex
@@ -117,6 +118,7 @@ struct FDemoRoot
 	float CameraDistance = 12.0f; // Distance from focus to camera eye.
 	float CameraViewScale = 1.0f; // Zoom factor applied to the orthographic view size.
 	bool bOrthographicProjection = true; // Use orthographic projection (parallel view rays). Default on.
+	XMFLOAT3 AlbedoColor = XMFLOAT3(0.5f, 0.5f, 0.5f); // Customizable albedo color for spheres.
 	bool bMouseDragging = false; // Left button held outside of ImGui UI.
 	float LastMouseX = 0.0f;
 	float LastMouseY = 0.0f;
@@ -212,6 +214,15 @@ static void UpdateUI(FDemoRoot &Root, float DeltaTime)
 		ImGui::Text("Projection");
 		if (ImGui::Checkbox("Orthographic", &Root.bOrthographicProjection))
 		{
+			Root.NumFrames = 0;
+		}
+	}
+
+	{
+		ImGui::Text("Albedo");
+		if (ImGui::ColorEdit3("##Albedo", &Root.AlbedoColor.x, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_PickerHueWheel))
+		{
+			// Reset progressive accumulation so the Reference mode picks up the new albedo immediately.
 			Root.NumFrames = 0;
 		}
 	}
@@ -481,7 +492,7 @@ static void Draw(FDemoRoot &Root)
 				XMStoreFloat4((XMFLOAT4 *)&CPUAddress->ObjectToWorld + 2, ObjectToWorldT.r[2]);
 			}
 
-			CPUAddress->Albedo = XMFLOAT3(0.5f, 0.0f, 0.0f);
+			CPUAddress->Albedo = Root.AlbedoColor;
 			CPUAddress->Metallic = MeshInst.Metallic;
 			CPUAddress->Roughness = MeshInst.Roughness;
 			CPUAddress->AO = 1.0f;
@@ -712,6 +723,9 @@ static void CreatePipelines(FGraphicsContext &Gfx, uint32_t NumSamples, eastl::v
 
 	EA_ASSERT(OutPipelines.size() == PSO_SHE_Calibrate);
 	AddComputePipeline(Gfx, "SHE_Calibrate.cs.cso", OutPipelines, OutSignatures);
+
+	EA_ASSERT(OutPipelines.size() == PSO_SHE_Diffuse);
+	AddComputePipeline(Gfx, "SHE_Diffuse.cs.cso", OutPipelines, OutSignatures);
 }
 
 static void CreateEnvMap(FGraphicsContext &Gfx, const FStaticMesh &Cube, const char *EnvironmentMapPath, ID3D12Resource *&OutEnvMap, D3D12_CPU_DESCRIPTOR_HANDLE &OutEnvMapSRV, eastl::vector<ID3D12Resource *> &OutTempResources)
@@ -1319,6 +1333,43 @@ static void SHECalibrate(FGraphicsContext &Gfx, ID3D12Resource *SHESHCoeff, D3D1
 									SHESHCoeff, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)));
 }
 
+static void SHEDiffuse(FGraphicsContext &Gfx, ID3D12Resource *SHESHCoeff, D3D12_CPU_DESCRIPTOR_HANDLE EnvMapSRV)
+{
+	// UAV over the whole coefficient buffer: the shader writes the diffuse
+	// coefficients into slots [34..43] with absolute indices, leaving the
+	// specular coefficients [0..33] untouched.
+	const D3D12_CPU_DESCRIPTOR_HANDLE TempSHESHCoeffTailUAV = AllocateDescriptors(Gfx, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
+	{
+		D3D12_UNORDERED_ACCESS_VIEW_DESC UAVDesc = {};
+		UAVDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+		UAVDesc.Buffer.NumElements = 44;
+		UAVDesc.Buffer.StructureByteStride = sizeof(XMFLOAT4);
+		UAVDesc.Format = DXGI_FORMAT_UNKNOWN;
+		Gfx.Device->CreateUnorderedAccessView(SHESHCoeff, nullptr, &UAVDesc, TempSHESHCoeffTailUAV);
+	}
+
+	ID3D12GraphicsCommandList2 *CmdList = Gfx.CmdList;
+
+	CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(
+									SHESHCoeff, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)));
+
+	CD3DX12_CPU_DESCRIPTOR_HANDLE TableBaseCPU;
+	CD3DX12_GPU_DESCRIPTOR_HANDLE TableBaseGPU;
+	AllocateGPUDescriptors(Gfx, 2, TableBaseCPU, TableBaseGPU);
+
+	Gfx.Device->CopyDescriptorsSimple(1, TableBaseCPU, EnvMapSRV, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+	TableBaseCPU.Offset(Gfx.DescriptorSize);
+
+	Gfx.Device->CopyDescriptorsSimple(1, TableBaseCPU, TempSHESHCoeffTailUAV, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+	TableBaseCPU.Offset(Gfx.DescriptorSize);
+
+	CmdList->SetComputeRootDescriptorTable(0, TableBaseGPU);
+	CmdList->Dispatch(1, 1, 1);
+
+	CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(
+									SHESHCoeff, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)));
+}
+
 static void ReleaseEnvironmentResources(FDemoRoot &Root)
 {
 	SAFE_RELEASE(Root.EnvMap);
@@ -1367,6 +1418,11 @@ static void RecordEnvironmentPrecomputation(FDemoRoot &Root, eastl::vector<ID3D1
 	Gfx.CmdList->SetPipelineState(Root.Pipelines[PSO_SHE_Calibrate]);
 	Gfx.CmdList->SetComputeRootSignature(Root.RootSignatures[PSO_SHE_Calibrate]);
 	SHECalibrate(Gfx, Root.SHESHCoeff, Root.SHEMatrixASRV, Root.SHEMatrixbSRV);
+
+	// 3-band SH diffuse irradiance from the environment map.
+	Gfx.CmdList->SetPipelineState(Root.Pipelines[PSO_SHE_Diffuse]);
+	Gfx.CmdList->SetComputeRootSignature(Root.RootSignatures[PSO_SHE_Diffuse]);
+	SHEDiffuse(Gfx, Root.SHESHCoeff, Root.EnvMapSRV);
 }
 
 static void FinishEnvironmentPrecomputation(FDemoRoot &Root, eastl::vector<ID3D12Resource *> &TempResources, eastl::vector<ID3D12Resource *> &TexturesThatNeedMipmaps)
@@ -1721,7 +1777,7 @@ static void Initialize(FDemoRoot &Root)
 	Root.CameraFocusPosition = XMFLOAT3(0.0f, 0.0f, 0.0f);
 
 	Root.LastIBLMode = Root.IBLMode = IBL_MODE_SPLIT_SUM_APPROXIMATION;
-	Root.LastMaterialMode = Root.MaterialMode = MATERIAL_MODE_SPECULAR_ONLY;
+	Root.LastMaterialMode = Root.MaterialMode = MATERIAL_MODE_DIFFUSE_AND_SPECULAR;
 	Root.NumFrames = 0;
 }
 

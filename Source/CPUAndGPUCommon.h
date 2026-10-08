@@ -65,7 +65,7 @@ struct SALIGN FSHEReductionConstantData
 
 struct SALIGN FSHECoefficientConstantData
 {
-	float4 Coeffs[34];
+	float4 Coeffs[44]; // [0..32] SHE specular coefficients, [33] auto bias, [34..42] 3-band SH diffuse irradiance, [43] unused.
 };
 
 #ifdef __cplusplus
