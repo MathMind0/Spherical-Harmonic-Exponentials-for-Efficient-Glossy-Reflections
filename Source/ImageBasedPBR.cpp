@@ -80,6 +80,13 @@ static const int GIBLModeGroupOrder[3] =
 	IBL_MODE_SPLIT_SUM_APPROXIMATION,
 };
 
+// Mouse orbit camera control parameters.
+static const float GCameraRotateSpeed = 0.005f;	   // Radians per pixel of mouse drag.
+static const float GCameraMaxPitch = XM_PIDIV2 * 0.9f; // ~81 degrees, keeps the billboard basis non-degenerate.
+static const float GCameraZoomSpeed = 0.1f;			   // Exponential zoom rate per wheel notch.
+static const float GCameraMinViewScale = 0.2f;		   // Zoom-in limit (smaller = larger spheres on screen).
+static const float GCameraMaxViewScale = 3.0f;		   // Zoom-out limit.
+
 struct FStaticMeshInstance
 {
 	XMFLOAT3 Position;
@@ -105,6 +112,14 @@ struct FDemoRoot
 	D3D12_INDEX_BUFFER_VIEW StaticIBView;
 	XMFLOAT3 CameraPosition;
 	XMFLOAT3 CameraFocusPosition;
+	float CameraYaw = 0.0f;		 // Orbit angle around the Y axis, radians.
+	float CameraPitch = 0.0f;	 // Orbit angle around the X axis, radians, clamped to +/-GCameraMaxPitch.
+	float CameraDistance = 12.0f; // Distance from focus to camera eye.
+	float CameraViewScale = 1.0f; // Zoom factor applied to the orthographic view size.
+	bool bMouseDragging = false; // Left button held outside of ImGui UI.
+	float LastMouseX = 0.0f;
+	float LastMouseY = 0.0f;
+	float PendingMouseWheel = 0.0f; // Wheel delta captured before NewFrame resets it.
 	ID3D12Resource *EnvMap;
 	ID3D12Resource *IrradianceMap;
 	ID3D12Resource *PrefilteredEnvMap;
@@ -148,6 +163,9 @@ static void UpdateUI(FDemoRoot &Root, float DeltaTime)
 	IO.KeyShift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
 	IO.KeyAlt = (GetKeyState(VK_MENU) & 0x8000) != 0;
 	IO.DeltaTime = DeltaTime;
+
+	// Capture the wheel delta before ImGui::NewFrame() resets MouseWheel each frame.
+	Root.PendingMouseWheel = IO.MouseWheel;
 
 	ImGui::NewFrame();
 
@@ -204,14 +222,47 @@ static void Update(FDemoRoot &Root)
 		RebuildEnvironment(Root);
 	}
 
-	// Update camera position.
-	//{
-	//	const float Angle = XMScalarModAngle(0.25f * (float)Time);
-	//	XMVECTOR Position = XMVectorSet(12.0f * cosf(Angle), 6.0f, 12.0f * sinf(Angle), 1.0f);
-	//	XMStoreFloat3(&Root.CameraPosition, Position);
-	//}
+	// Mouse orbit camera control: left-drag to rotate, wheel to zoom.
+	// MouseWheel is reset by ImGui::NewFrame() (called in UpdateUI above), so it was
+	// captured into Root.PendingMouseWheel inside UpdateUI before NewFrame runs.
+	if (Root.PendingMouseWheel != 0.0f && !ImGui::GetIO().WantCaptureMouse)
+	{
+		Root.CameraViewScale *= powf(GCameraMaxViewScale / GCameraMinViewScale, -Root.PendingMouseWheel * GCameraZoomSpeed);
+		Root.CameraViewScale = XMMin(GCameraMaxViewScale, XMMax(GCameraMinViewScale, Root.CameraViewScale));
+		Root.NumFrames = 0;
+	}
 
-	// ImGui::ShowDemoWindow();
+	ImGuiIO &MouseIO = ImGui::GetIO();
+	if (MouseIO.MouseDown[0] && !MouseIO.WantCaptureMouse)
+	{
+		if (Root.bMouseDragging)
+		{
+			Root.CameraYaw += (MouseIO.MousePos.x - Root.LastMouseX) * GCameraRotateSpeed;
+			Root.CameraPitch += (MouseIO.MousePos.y - Root.LastMouseY) * GCameraRotateSpeed;
+			Root.CameraPitch = XMMin(GCameraMaxPitch, XMMax(-GCameraMaxPitch, Root.CameraPitch));
+			Root.NumFrames = 0;
+		}
+		Root.bMouseDragging = true;
+		Root.LastMouseX = MouseIO.MousePos.x;
+		Root.LastMouseY = MouseIO.MousePos.y;
+	}
+	else
+	{
+		Root.bMouseDragging = false;
+	}
+
+	// Update camera position from orbit angles (focus stays at CameraFocusPosition).
+	{
+		const float Yaw = Root.CameraYaw;
+		const float Pitch = Root.CameraPitch;
+		const XMVECTOR Direction = XMVectorSet(
+			sinf(Yaw) * cosf(Pitch),
+			sinf(Pitch),
+			cosf(Yaw) * cosf(Pitch),
+			0.0f);
+		XMStoreFloat3(&Root.CameraPosition,
+			XMLoadFloat3(&Root.CameraFocusPosition) + Direction * Root.CameraDistance);
+	}
 }
 
 static void Draw(FDemoRoot &Root)
@@ -243,6 +294,8 @@ static void Draw(FDemoRoot &Root)
 		ViewHeight = GridHeight + 2.0f;
 		ViewWidth = ViewHeight * AspectRatio;
 	}
+	ViewWidth *= Root.CameraViewScale;
+	ViewHeight *= Root.CameraViewScale;
 	const XMMATRIX ProjectionTransform = XMMatrixOrthographicLH(ViewWidth, ViewHeight, 0.1f, 100.0f);
 
 	// Clear accumulation buffer if needed.
@@ -274,6 +327,23 @@ static void Draw(FDemoRoot &Root)
 		CmdList->SetGraphicsRootSignature(Root.RootSignatures[PSO_SimpleForward]);
 
 		const XMMATRIX WorldToClip = ViewTransform * ProjectionTransform;
+
+		// Billboard basis: rotate the whole sphere grid (laid out on the local XY plane,
+		// normal +Z) so it always faces the camera. Built from the view direction.
+		const XMVECTOR Forward = XMVector3Normalize(
+			XMLoadFloat3(&Root.CameraFocusPosition) - XMLoadFloat3(&Root.CameraPosition));
+		const XMVECTOR UpRef = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+		const XMVECTOR Right = XMVector3Normalize(XMVector3Cross(UpRef, Forward));
+		const XMVECTOR Up = XMVector3Cross(Forward, Right);
+		XMFLOAT3 RightF, UpF, ForwardF;
+		XMStoreFloat3(&RightF, Right);
+		XMStoreFloat3(&UpF, Up);
+		XMStoreFloat3(&ForwardF, Forward);
+		const XMMATRIX Billboard = XMMatrixSet(
+			RightF.x, RightF.y, RightF.z, 0.0f,
+			UpF.x, UpF.y, UpF.z, 0.0f,
+			ForwardF.x, ForwardF.y, ForwardF.z, 0.0f,
+			0.0f, 0.0f, 0.0f, 1.0f);
 
 		for (int32_t GroupIdx = 0; GroupIdx < 3; ++GroupIdx)
 		{
@@ -348,7 +418,8 @@ static void Draw(FDemoRoot &Root)
 
 			const XMMATRIX ObjectToWorld =
 				XMMatrixRotationRollPitchYaw(MeshInst.Rotation.x, MeshInst.Rotation.y, MeshInst.Rotation.z) *
-				XMMatrixTranslation(MeshInst.Position.x, MeshInst.Position.y, MeshInst.Position.z);
+				XMMatrixTranslation(MeshInst.Position.x, MeshInst.Position.y, MeshInst.Position.z) *
+				Billboard;
 
 			XMStoreFloat4x4(&CPUAddress->ObjectToClip, XMMatrixTranspose(ObjectToWorld * WorldToClip));
 			{
@@ -398,10 +469,13 @@ static void Draw(FDemoRoot &Root)
 		XMMATRIX ViewTransformOrigin = ViewTransform;
 		ViewTransformOrigin.r[3] = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f);
 
-		const XMMATRIX ObjectToClip = ViewTransformOrigin * ProjectionTransform;
+		// Scale the unit sphere so its interior shell encloses the whole orthographic frustum.
+		// Radius must cover the frustum half-diagonal and stay inside the far plane (100).
+		const float SkySphereScale = 50.0f;
+		const XMMATRIX ObjectToClip = XMMatrixScaling(SkySphereScale, SkySphereScale, SkySphereScale) * ViewTransformOrigin * ProjectionTransform;
 		XMStoreFloat4x4(&CPUAddress->ObjectToClip, XMMatrixTranspose(ObjectToClip));
 
-		const FStaticMesh &Mesh = Root.StaticMeshes[MESH_Cube];
+		const FStaticMesh &Mesh = Root.StaticMeshes[MESH_Sphere];
 
 		CmdList->SetGraphicsRootConstantBufferView(0, GPUAddress);
 		CmdList->SetGraphicsRootDescriptorTable(1, CopyDescriptorsToGPUHeap(Gfx, 1, Root.EnvMapSRV));
@@ -529,7 +603,7 @@ static void CreatePipelines(FGraphicsContext &Gfx, uint32_t NumSamples, eastl::v
 		D3D12_GRAPHICS_PIPELINE_STATE_DESC PSODesc = {};
 		PSODesc.InputLayout = {InPositionNormal, (UINT)eastl::size(InPositionNormal)};
 		PSODesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
-		PSODesc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+		PSODesc.RasterizerState.CullMode = D3D12_CULL_MODE_FRONT;
 		PSODesc.RasterizerState.MultisampleEnable = NumSamples > 1 ? TRUE : FALSE;
 		PSODesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
 		PSODesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
