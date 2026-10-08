@@ -116,6 +116,7 @@ struct FDemoRoot
 	float CameraPitch = 0.0f;	 // Orbit angle around the X axis, radians, clamped to +/-GCameraMaxPitch.
 	float CameraDistance = 12.0f; // Distance from focus to camera eye.
 	float CameraViewScale = 1.0f; // Zoom factor applied to the orthographic view size.
+	bool bOrthographicProjection = true; // Use orthographic projection (parallel view rays). Default on.
 	bool bMouseDragging = false; // Left button held outside of ImGui UI.
 	float LastMouseX = 0.0f;
 	float LastMouseY = 0.0f;
@@ -207,6 +208,14 @@ static void UpdateUI(FDemoRoot &Root, float DeltaTime)
 		}
 	}
 
+	{
+		ImGui::Text("Projection");
+		if (ImGui::Checkbox("Orthographic", &Root.bOrthographicProjection))
+		{
+			Root.NumFrames = 0;
+		}
+	}
+
 	ImGui::End();
 }
 
@@ -283,20 +292,52 @@ static void Draw(FDemoRoot &Root)
 
 	const XMMATRIX ViewTransform = XMMatrixLookAtLH(XMLoadFloat3(&Root.CameraPosition), XMLoadFloat3(&Root.CameraFocusPosition), XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f));
 
-	// Orthographic projection: fit the 10x6 sphere grid with margin. Grid spans 22 x 13.2 units.
-	const float AspectRatio = 1.777f;
-	const float GridWidth = 10 * 2.2f;
-	const float GridHeight = 6 * 2.2f;
-	float ViewWidth = GridWidth + 4.0f;
-	float ViewHeight = ViewWidth / AspectRatio;
-	if (ViewHeight < GridHeight + 2.0f)
+	// Projection: orthographic fits the 10x6 sphere grid with margin (grid spans
+	// 22 x 13.2 units). Perspective uses the orbit distance to frame the grid.
+	XMMATRIX ProjectionTransform;
+	if (Root.bOrthographicProjection)
 	{
-		ViewHeight = GridHeight + 2.0f;
-		ViewWidth = ViewHeight * AspectRatio;
+		const float AspectRatio = 1.777f;
+		const float GridWidth = 10 * 2.2f;
+		const float GridHeight = 6 * 2.2f;
+		float ViewWidth = GridWidth + 4.0f;
+		float ViewHeight = ViewWidth / AspectRatio;
+		if (ViewHeight < GridHeight + 2.0f)
+		{
+			ViewHeight = GridHeight + 2.0f;
+			ViewWidth = ViewHeight * AspectRatio;
+		}
+		ViewWidth *= Root.CameraViewScale;
+		ViewHeight *= Root.CameraViewScale;
+		ProjectionTransform = XMMatrixOrthographicLH(ViewWidth, ViewHeight, 0.1f, 100.0f);
 	}
-	ViewWidth *= Root.CameraViewScale;
-	ViewHeight *= Root.CameraViewScale;
-	const XMMATRIX ProjectionTransform = XMMatrixOrthographicLH(ViewWidth, ViewHeight, 0.1f, 100.0f);
+	else
+	{
+		// Perspective FOV derived so that at the current orbit distance the grid
+		// (with the same margin) fills the viewport similarly to the ortho view.
+		const float AspectRatio = 1.777f;
+		const float GridWidth = 10 * 2.2f;
+		const float GridHeight = 6 * 2.2f;
+		float ViewWidth = GridWidth + 4.0f;
+		float ViewHeight = ViewWidth / AspectRatio;
+		if (ViewHeight < GridHeight + 2.0f)
+		{
+			ViewHeight = GridHeight + 2.0f;
+			ViewWidth = ViewHeight * AspectRatio;
+		}
+		ViewWidth *= Root.CameraViewScale;
+		ViewHeight *= Root.CameraViewScale;
+		const float Distance = XMMax(Root.CameraDistance, 0.1f);
+		// Vertical FOV half-angle that covers ViewHeight at Distance; use the
+		// larger of the two half-extents mapped through the aspect ratio so the
+		// whole grid stays visible.
+		const float HalfHeight = ViewHeight * 0.5f;
+		const float HalfWidth = ViewWidth * 0.5f;
+		const float HalfAngleV = atanf(HalfHeight / Distance);
+		const float HalfAngleH = atanf(HalfWidth / Distance);
+		const float FovV = XMMin(HalfAngleV, HalfAngleH < 0.0001f ? HalfAngleV : atanf(tanf(HalfAngleH) / AspectRatio));
+		ProjectionTransform = XMMatrixPerspectiveFovLH(FovV * 2.0f, AspectRatio, 0.1f, 100.0f);
+	}
 
 	// Clear accumulation buffer if needed.
 	if (Root.LastMaterialMode != Root.MaterialMode || Root.LastIBLMode != Root.IBLMode)
@@ -366,6 +407,17 @@ static void Draw(FDemoRoot &Root)
 
 			const XMFLOAT3 P = Root.CameraPosition;
 			CPUAddress->ViewerPosition = XMFLOAT4(P.x, P.y, P.z, 1.0f);
+
+			// Unit vector from the focus point toward the camera eye. In
+			// orthographic mode the shader uses -ViewDirection as the constant
+			// per-pixel view vector (rays travel from the eye toward the focus).
+			const XMVECTOR ViewDir = XMVector3Normalize(
+				XMLoadFloat3(&Root.CameraPosition) - XMLoadFloat3(&Root.CameraFocusPosition));
+			XMFLOAT3 ViewDirF;
+			XMStoreFloat3(&ViewDirF, ViewDir);
+			CPUAddress->ViewDirection = XMFLOAT4(ViewDirF.x, ViewDirF.y, ViewDirF.z, 0.0f);
+			CPUAddress->bOrthographic = Root.bOrthographicProjection ? 1 : 0;
+
 			CPUAddress->MaterialMode = Root.MaterialMode;
 			CPUAddress->IBLMode = GroupIBLMode;
 			CPUAddress->NumFrames = Root.NumFrames;

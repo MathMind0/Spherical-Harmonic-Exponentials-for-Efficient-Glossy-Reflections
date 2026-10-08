@@ -38,9 +38,11 @@ struct SALIGN FPerFrameConstantData
 	float4 LightPositions[4];
 	float4 LightColors[4];
 	float4 ViewerPosition;
+	float4 ViewDirection; // Unit vector from the focus point toward the camera eye. Used as the constant per-pixel view vector in orthographic mode.
 	int MaterialMode;
 	int IBLMode;
 	uint32_t NumFrames;
+	int bOrthographic; // 1 = orthographic (parallel view rays, use ViewDirection), 0 = perspective (rays converge at ViewerPosition).
 };
 
 struct SALIGN FSHEBuildConstantData
