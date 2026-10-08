@@ -865,5 +865,8 @@
     <FxCompile Include="..\Source\Shaders\SHE_Calibrate.hlsl">
       <Filter>Shaders</Filter>
     </FxCompile>
+    <FxCompile Include="..\Source\Shaders\SHE_Diffuse.hlsl">
+      <Filter>Shaders</Filter>
+    </FxCompile>
   </ItemGroup>
 </Project>

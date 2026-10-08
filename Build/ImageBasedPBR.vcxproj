@@ -292,6 +292,7 @@
     <FxCompile Include="..\Source\Shaders\SHE_Reduction_Merge.hlsl" />
     <FxCompile Include="..\Source\Shaders\SHE_Solve.hlsl" />
     <FxCompile Include="..\Source\Shaders\SHE_Calibrate.hlsl" />
+    <FxCompile Include="..\Source\Shaders\SHE_Diffuse.hlsl" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>16.0</VCProjectVersion>
