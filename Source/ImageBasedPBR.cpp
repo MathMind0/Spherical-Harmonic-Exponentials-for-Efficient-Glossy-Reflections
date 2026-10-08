@@ -43,7 +43,11 @@ enum
 	PSO_SHE_Reduction_Merge,
 	PSO_SHE_Solve,
 	PSO_SHE_Calibrate,
-	PSO_SHE_Diffuse,
+	PSO_SHE_Diffuse,                 // Placeholder index, unused directly.
+	PSO_SHE_Diffuse_Wave32,          // Stage 1 partial projection, wave32 groups.
+	PSO_SHE_Diffuse_Wave64,          // Stage 1 partial projection, wave64 groups.
+	PSO_SHE_Diffuse_Finalize_Wave32, // Stage 2 partial sum + convolution writeback, wave32.
+	PSO_SHE_Diffuse_Finalize_Wave64, // Stage 2 partial sum + convolution writeback, wave64.
 };
 
 struct FVertex
@@ -155,6 +159,7 @@ struct FDemoRoot
 	float RoughnessStart = 0.4f;
 	uint32_t NumSamples;
 	uint32_t NumFrames;
+	uint32_t WaveSize = 32; // GPU wave size in lanes (32 NVIDIA/Intel, 64 AMD), used to select SHE diffuse PSO variants.
 };
 
 static void RebuildEnvironment(FDemoRoot &Root);
@@ -619,8 +624,37 @@ static void AddComputePipeline(FGraphicsContext &Gfx, const char *CSName, eastl:
 	OutSignatures.push_back(RootSignature);
 }
 
-static void CreatePipelines(FGraphicsContext &Gfx, uint32_t NumSamples, eastl::vector<ID3D12PipelineState *> &OutPipelines, eastl::vector<ID3D12RootSignature *> &OutSignatures)
+static void CreatePipelines(FGraphicsContext &Gfx, uint32_t NumSamples, eastl::vector<ID3D12PipelineState *> &OutPipelines, eastl::vector<ID3D12RootSignature *> &OutSignatures, uint32_t &OutWaveSize)
 {
+	// Detect the GPU wave size via the adapter vendor: AMD GPUs execute
+	// 64-wide waves, others (NVIDIA, Intel) execute 32-wide waves.
+	OutWaveSize = 32;
+	{
+		LUID AdapterLuid = Gfx.Device->GetAdapterLuid();
+		IDXGIFactory4 *Factory = nullptr;
+		if (SUCCEEDED(CreateDXGIFactory2(0, IID_PPV_ARGS(&Factory))))
+		{
+			IDXGIAdapter1 *Adapter = nullptr;
+			for (uint32_t Idx = 0; Factory->EnumAdapters1(Idx, &Adapter) != DXGI_ERROR_NOT_FOUND; ++Idx)
+			{
+				DXGI_ADAPTER_DESC1 Desc = {};
+				Adapter->GetDesc1(&Desc);
+				if (memcmp(&Desc.AdapterLuid, &AdapterLuid, sizeof(LUID)) == 0)
+				{
+					// AMD GPUs execute 64-wide waves.
+					if (Desc.VendorId == 0x1002)
+					{
+						OutWaveSize = 64;
+					}
+					break;
+				}
+				Adapter->Release();
+			}
+			SAFE_RELEASE(Adapter);
+			Factory->Release();
+		}
+	}
+
 	const D3D12_INPUT_ELEMENT_DESC InPositionNormal[] =
 		{
 			{"_Position", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
@@ -725,7 +759,13 @@ static void CreatePipelines(FGraphicsContext &Gfx, uint32_t NumSamples, eastl::v
 	AddComputePipeline(Gfx, "SHE_Calibrate.cs.cso", OutPipelines, OutSignatures);
 
 	EA_ASSERT(OutPipelines.size() == PSO_SHE_Diffuse);
-	AddComputePipeline(Gfx, "SHE_Diffuse.cs.cso", OutPipelines, OutSignatures);
+	// Create both wave-size variants of the SH diffuse stage-1 and finalize
+	// shaders; the CPU picks the matching variant at dispatch time based on
+	// the detected GPU wave size (see the top of CreatePipelines).
+	AddComputePipeline(Gfx, "SHE_Diffuse_Wave32.cs.cso", OutPipelines, OutSignatures);
+	AddComputePipeline(Gfx, "SHE_Diffuse_Wave64.cs.cso", OutPipelines, OutSignatures);
+	AddComputePipeline(Gfx, "SHE_Diffuse_Finalize_Wave32.cs.cso", OutPipelines, OutSignatures);
+	AddComputePipeline(Gfx, "SHE_Diffuse_Finalize_Wave64.cs.cso", OutPipelines, OutSignatures);
 }
 
 static void CreateEnvMap(FGraphicsContext &Gfx, const FStaticMesh &Cube, const char *EnvironmentMapPath, ID3D12Resource *&OutEnvMap, D3D12_CPU_DESCRIPTOR_HANDLE &OutEnvMapSRV, eastl::vector<ID3D12Resource *> &OutTempResources)
@@ -1333,19 +1373,70 @@ static void SHECalibrate(FGraphicsContext &Gfx, ID3D12Resource *SHESHCoeff, D3D1
 									SHESHCoeff, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)));
 }
 
-static void SHEDiffuse(FGraphicsContext &Gfx, ID3D12Resource *SHESHCoeff, D3D12_CPU_DESCRIPTOR_HANDLE EnvMapSRV)
+static void SHEDiffuse(FDemoRoot &Root, FGraphicsContext &Gfx, ID3D12Resource *SHESHCoeff, D3D12_CPU_DESCRIPTOR_HANDLE EnvMapSRV, eastl::vector<ID3D12Resource *> &OutTempResources)
 {
-	// UAV over the whole coefficient buffer: the shader writes the diffuse
-	// coefficients into slots [34..43] with absolute indices, leaving the
-	// specular coefficients [0..33] untouched.
-	const D3D12_CPU_DESCRIPTOR_HANDLE TempSHESHCoeffTailUAV = AllocateDescriptors(Gfx, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
+	// Two-stage parallel projection of the environment map onto 3-band SH:
+	//   Stage 1: one group == one wave (WaveSize lanes), each thread integrates
+	//            16 Hammersley samples, WaveActiveSum reduces the group, lane 0
+	//            writes 9 float3 partials per group.
+	//   Stage 2: a single group sums all partials and writes the final
+	//            coefficients (with 4*pi/N normalization and Ramamoorthi
+	//            cosine-band convolution) into SHESHCoeff slots [34..42].
+	const uint32_t TotalSampleCount = 65536;
+	const uint32_t SamplesPerThread = 16;
+	const uint32_t ThreadCountX = Root.WaveSize; // group size == wave size
+	const uint32_t GroupCount = TotalSampleCount / (SamplesPerThread * ThreadCountX); // 128 (wave32) / 64 (wave64)
+
+	// Whole-buffer UAV over SHESHCoeff: the finalize pass writes slots [34..43]
+	// with absolute indices, leaving the specular coefficients [0..33] untouched.
+	const D3D12_CPU_DESCRIPTOR_HANDLE SHESHCoeffUAV = AllocateDescriptors(Gfx, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
 	{
 		D3D12_UNORDERED_ACCESS_VIEW_DESC UAVDesc = {};
 		UAVDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
 		UAVDesc.Buffer.NumElements = 44;
 		UAVDesc.Buffer.StructureByteStride = sizeof(XMFLOAT4);
 		UAVDesc.Format = DXGI_FORMAT_UNKNOWN;
-		Gfx.Device->CreateUnorderedAccessView(SHESHCoeff, nullptr, &UAVDesc, TempSHESHCoeffTailUAV);
+		Gfx.Device->CreateUnorderedAccessView(SHESHCoeff, nullptr, &UAVDesc, SHESHCoeffUAV);
+	}
+
+	// Stage-1 partial buffer: GroupCount x 9 x float3.
+	ID3D12Resource *PartialRadiance;
+	const D3D12_CPU_DESCRIPTOR_HANDLE PartialRadianceUAV = AllocateDescriptors(Gfx, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
+	const D3D12_CPU_DESCRIPTOR_HANDLE PartialRadianceSRV = AllocateDescriptors(Gfx, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
+	{
+		const D3D12_RESOURCE_DESC Desc = CD3DX12_RESOURCE_DESC::Buffer(GroupCount * 9 * sizeof(XMFLOAT3), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+		VHR(Gfx.Device->CreateCommittedResource(get_rvalue_ptr(CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT)), D3D12_HEAP_FLAG_NONE, &Desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&PartialRadiance)));
+		OutTempResources.push_back(PartialRadiance);
+
+		D3D12_UNORDERED_ACCESS_VIEW_DESC UAVDesc = {};
+		UAVDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+		UAVDesc.Buffer.NumElements = GroupCount * 9;
+		UAVDesc.Buffer.StructureByteStride = sizeof(XMFLOAT3);
+		UAVDesc.Format = DXGI_FORMAT_UNKNOWN;
+		Gfx.Device->CreateUnorderedAccessView(PartialRadiance, nullptr, &UAVDesc, PartialRadianceUAV);
+
+		D3D12_SHADER_RESOURCE_VIEW_DESC SRVDesc = {};
+		SRVDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+		SRVDesc.Format = DXGI_FORMAT_UNKNOWN;
+		SRVDesc.Buffer.NumElements = GroupCount * 9;
+		SRVDesc.Buffer.StructureByteStride = sizeof(XMFLOAT3);
+		SRVDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		Gfx.Device->CreateShaderResourceView(PartialRadiance, &SRVDesc, PartialRadianceSRV);
+	}
+
+	// Upload the shared stage parameters.
+	D3D12_GPU_VIRTUAL_ADDRESS GPUAddress;
+	auto *CPUAddress = (FSHEDiffuseParams *)AllocateGPUMemory(Gfx, sizeof(FSHEDiffuseParams), GPUAddress);
+	CPUAddress->TotalSampleCount = TotalSampleCount;
+	CPUAddress->SamplesPerThread = SamplesPerThread;
+	CPUAddress->ThreadCountX = ThreadCountX;
+
+	const D3D12_CPU_DESCRIPTOR_HANDLE ParamsCBV = AllocateDescriptors(Gfx, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
+	{
+		D3D12_CONSTANT_BUFFER_VIEW_DESC CBVDesc = {};
+		CBVDesc.BufferLocation = GPUAddress;
+		CBVDesc.SizeInBytes = sizeof(FSHEDiffuseParams);
+		Gfx.Device->CreateConstantBufferView(&CBVDesc, ParamsCBV);
 	}
 
 	ID3D12GraphicsCommandList2 *CmdList = Gfx.CmdList;
@@ -1353,18 +1444,54 @@ static void SHEDiffuse(FGraphicsContext &Gfx, ID3D12Resource *SHESHCoeff, D3D12_
 	CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(
 									SHESHCoeff, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)));
 
-	CD3DX12_CPU_DESCRIPTOR_HANDLE TableBaseCPU;
-	CD3DX12_GPU_DESCRIPTOR_HANDLE TableBaseGPU;
-	AllocateGPUDescriptors(Gfx, 2, TableBaseCPU, TableBaseGPU);
+	// Stage 1: partial projection, one wave per group.
+	{
+		const uint32_t Stage1PSO = (Root.WaveSize == 64) ? PSO_SHE_Diffuse_Wave64 : PSO_SHE_Diffuse_Wave32;
+		CmdList->SetPipelineState(Root.Pipelines[Stage1PSO]);
+		CmdList->SetComputeRootSignature(Root.RootSignatures[Stage1PSO]);
 
-	Gfx.Device->CopyDescriptorsSimple(1, TableBaseCPU, EnvMapSRV, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-	TableBaseCPU.Offset(Gfx.DescriptorSize);
+		CD3DX12_CPU_DESCRIPTOR_HANDLE TableBaseCPU;
+		CD3DX12_GPU_DESCRIPTOR_HANDLE TableBaseGPU;
+		AllocateGPUDescriptors(Gfx, 3, TableBaseCPU, TableBaseGPU);
 
-	Gfx.Device->CopyDescriptorsSimple(1, TableBaseCPU, TempSHESHCoeffTailUAV, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-	TableBaseCPU.Offset(Gfx.DescriptorSize);
+		Gfx.Device->CopyDescriptorsSimple(1, TableBaseCPU, ParamsCBV, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+		TableBaseCPU.Offset(Gfx.DescriptorSize);
 
-	CmdList->SetComputeRootDescriptorTable(0, TableBaseGPU);
-	CmdList->Dispatch(1, 1, 1);
+		Gfx.Device->CopyDescriptorsSimple(1, TableBaseCPU, EnvMapSRV, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+		TableBaseCPU.Offset(Gfx.DescriptorSize);
+
+		Gfx.Device->CopyDescriptorsSimple(1, TableBaseCPU, PartialRadianceUAV, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+		TableBaseCPU.Offset(Gfx.DescriptorSize);
+
+		CmdList->SetComputeRootDescriptorTable(0, TableBaseGPU);
+		CmdList->Dispatch(GroupCount, 1, 1);
+	}
+
+	// UAV barrier: all stage-1 writes must complete before stage 2 reads.
+	CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::UAV(PartialRadiance)));
+
+	// Stage 2: sum partials, convolve, write back.
+	{
+		const uint32_t Stage2PSO = (Root.WaveSize == 64) ? PSO_SHE_Diffuse_Finalize_Wave64 : PSO_SHE_Diffuse_Finalize_Wave32;
+		CmdList->SetPipelineState(Root.Pipelines[Stage2PSO]);
+		CmdList->SetComputeRootSignature(Root.RootSignatures[Stage2PSO]);
+
+		CD3DX12_CPU_DESCRIPTOR_HANDLE TableBaseCPU;
+		CD3DX12_GPU_DESCRIPTOR_HANDLE TableBaseGPU;
+		AllocateGPUDescriptors(Gfx, 3, TableBaseCPU, TableBaseGPU);
+
+		Gfx.Device->CopyDescriptorsSimple(1, TableBaseCPU, ParamsCBV, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+		TableBaseCPU.Offset(Gfx.DescriptorSize);
+
+		Gfx.Device->CopyDescriptorsSimple(1, TableBaseCPU, PartialRadianceSRV, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+		TableBaseCPU.Offset(Gfx.DescriptorSize);
+
+		Gfx.Device->CopyDescriptorsSimple(1, TableBaseCPU, SHESHCoeffUAV, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+		TableBaseCPU.Offset(Gfx.DescriptorSize);
+
+		CmdList->SetComputeRootDescriptorTable(0, TableBaseGPU);
+		CmdList->Dispatch(1, 1, 1);
+	}
 
 	CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(
 									SHESHCoeff, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)));
@@ -1419,10 +1546,9 @@ static void RecordEnvironmentPrecomputation(FDemoRoot &Root, eastl::vector<ID3D1
 	Gfx.CmdList->SetComputeRootSignature(Root.RootSignatures[PSO_SHE_Calibrate]);
 	SHECalibrate(Gfx, Root.SHESHCoeff, Root.SHEMatrixASRV, Root.SHEMatrixbSRV);
 
-	// 3-band SH diffuse irradiance from the environment map.
-	Gfx.CmdList->SetPipelineState(Root.Pipelines[PSO_SHE_Diffuse]);
-	Gfx.CmdList->SetComputeRootSignature(Root.RootSignatures[PSO_SHE_Diffuse]);
-	SHEDiffuse(Gfx, Root.SHESHCoeff, Root.EnvMapSRV);
+	// 3-band SH diffuse irradiance from the environment map (two-stage
+	// dispatch; PSOs are set inside SHEDiffuse per stage).
+	SHEDiffuse(Root, Gfx, Root.SHESHCoeff, Root.EnvMapSRV, TempResources);
 }
 
 static void FinishEnvironmentPrecomputation(FDemoRoot &Root, eastl::vector<ID3D12Resource *> &TempResources, eastl::vector<ID3D12Resource *> &TexturesThatNeedMipmaps)
@@ -1628,7 +1754,7 @@ static void Initialize(FDemoRoot &Root)
 
 	Root.NumSamples = 1;
 	CreateUIContext(Gfx, Root.NumSamples, Root.UI, TempResources);
-	CreatePipelines(Gfx, Root.NumSamples, Root.Pipelines, Root.RootSignatures);
+	CreatePipelines(Gfx, Root.NumSamples, Root.Pipelines, Root.RootSignatures, Root.WaveSize);
 
 	eastl::vector<FVertex> AllVertices;
 	eastl::vector<uint32_t> AllIndices;

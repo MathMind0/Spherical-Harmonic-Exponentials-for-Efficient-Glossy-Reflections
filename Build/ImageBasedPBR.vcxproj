@@ -278,6 +278,8 @@
     <None Include="..\Source\External\EAStdC\Win32\EAMathHelpWin32.inl" />
     <None Include="..\Source\Shaders\Common.hlsli" />
     <None Include="..\Source\Shaders\SHE_Math.hlsli" />
+    <None Include="..\Source\Shaders\SHE_Diffuse.hlsl" />
+    <None Include="..\Source\Shaders\SHE_Diffuse_Finalize.hlsl" />
   </ItemGroup>
   <ItemGroup>
     <FxCompile Include="..\Source\Shaders\GenerateBRDFIntegrationMap.hlsl" />
@@ -292,7 +294,10 @@
     <FxCompile Include="..\Source\Shaders\SHE_Reduction_Merge.hlsl" />
     <FxCompile Include="..\Source\Shaders\SHE_Solve.hlsl" />
     <FxCompile Include="..\Source\Shaders\SHE_Calibrate.hlsl" />
-    <FxCompile Include="..\Source\Shaders\SHE_Diffuse.hlsl" />
+    <FxCompile Include="..\Source\Shaders\SHE_Diffuse_Wave32.hlsl" />
+    <FxCompile Include="..\Source\Shaders\SHE_Diffuse_Wave64.hlsl" />
+    <FxCompile Include="..\Source\Shaders\SHE_Diffuse_Finalize_Wave32.hlsl" />
+    <FxCompile Include="..\Source\Shaders\SHE_Diffuse_Finalize_Wave64.hlsl" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>16.0</VCProjectVersion>

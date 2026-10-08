@@ -63,6 +63,13 @@ struct SALIGN FSHEReductionConstantData
 	int32_t SphericalHarmonicCount;
 };
 
+struct SALIGN FSHEDiffuseParams
+{
+	uint32_t TotalSampleCount; // e.g. 65536
+	uint32_t SamplesPerThread; // 16
+	uint32_t ThreadCountX;     // group thread count == wave size (32 or 64)
+};
+
 struct SALIGN FSHECoefficientConstantData
 {
 	float4 Coeffs[44]; // [0..32] SHE specular coefficients, [33] auto bias, [34..42] 3-band SH diffuse irradiance, [43] unused.

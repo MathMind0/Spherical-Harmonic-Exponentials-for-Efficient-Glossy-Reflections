@@ -2,23 +2,22 @@
 #include "Common.hlsli"
 #include "SHE_Math.hlsli"
 
-// Project the environment map onto 3-band SH (9 coefficients per color channel)
-// convolved with the clamped cosine lobe (Ramamoorthi 2001), so that the
-// diffuse irradiance is a simple dot product of 9 coefficients with the
-// SH basis evaluated at the surface normal.
+// Project the environment map onto 3-band SH (9 coefficients per color channel),
+// stage 1 of 2: parallel partial projection.
 //
-// Result layout in GSHESHCoeff (float4 each):
-//   [34 .. 42] : RGB diffuse irradiance SH coefficients, w unused
-//   [43]       : unused
+// Dispatch: NumGroups groups, one wave per group (32 or 64 threads depending
+// on the GPU wave size, selected by the CPU via the appropriate PSO variant).
+// Each thread integrates 16 Hammersley samples into a local accumulator and
+// the whole group is reduced with WaveActiveSum. The group's lane 0 writes
+// one partial result (9 x float3) into GPartialRadiance.
 //
-// Slots [0..32] hold the SHE specular coefficients and [33] the auto bias;
-// they are written by SHE_Solve/SHE_Calibrate and must not be touched here.
-//
-// The pass writes 10 float4s, i.e. one thread.
+// Stage 2 (SHE_Diffuse_Finalize.hlsl) sums the partials, applies the 4*pi/N
+// normalization and the Ramamoorthi cosine-band convolution, and writes the
+// final coefficients into slots [34..42] of GSHESHCoeff.
 
 #define GRootSignature \
     "RootFlags(0), " \
-    "DescriptorTable(SRV(t0), UAV(u0), visibility = SHADER_VISIBILITY_ALL), " \
+    "DescriptorTable(CBV(b0), SRV(t0), UAV(u0), visibility = SHADER_VISIBILITY_ALL), " \
     "StaticSampler(" \
         "s0, " \
         "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT, " \
@@ -30,29 +29,36 @@
 TextureCube GEnvMap : register(t0);
 SamplerState GSampler : register(s0);
 
-RWStructuredBuffer<float4> GSHESHCoeff : register(u0);
+RWStructuredBuffer<float3> GPartialRadiance : register(u0);
+
+cbuffer GDiffuseParams : register(b0)
+{
+    FSHEDiffuseParams GParams;
+}
 
 [RootSignature(GRootSignature)]
-[numthreads(1, 1, 1)]
-void MainCS()
+[numthreads(GROUP_SIZE_X, 1, 1)]
+void MainCS(uint3 GroupID : SV_GroupID, uint LaneIndex : SV_GroupThreadID)
 {
-    // Clamped cosine lobe convolved in SH space (Ramamoorthi 2001):
-    // E(N) = sum_lm A_l * L_lm * y_lm(N), with L_lm = int L(s) y_lm(s) ds.
-    const float IrradianceBandA[3] =
-    {
-        PI,             // A_0
-        2.0f * PI / 3.0f, // A_1
-        PI / 4.0f,      // A_2
-    };
+    const uint SamplesPerGroup = GParams.SamplesPerThread * GParams.ThreadCountX;
 
     float3 SHRadiance[9] = (float3[9])0;
 
-    // Monte Carlo integration over the sphere with uniform sampling.
-    // Estimator of a projection coefficient: E[ L(s) * y_j(s) ] with pdf 1/4pi.
-    const uint NumSamples = 65536;
-    for (uint SampleIndex = 0; SampleIndex < NumSamples; ++SampleIndex)
+    // Hammersley samples owned by this thread: a contiguous chunk so that
+    // consecutive lanes touch consecutive (low-discrepancy) sample indices,
+    // which keeps the per-group sample set identical to the serial version.
+    const uint FirstSample = GroupID.x * SamplesPerGroup + LaneIndex * GParams.SamplesPerThread;
+
+    [unroll]
+    for (uint LocalIdx = 0; LocalIdx < SAMPLES_PER_THREAD; ++LocalIdx)
     {
-        float2 Xi = Hammersley(SampleIndex, NumSamples);
+        const uint SampleIndex = FirstSample + LocalIdx;
+        if (SampleIndex >= GParams.TotalSampleCount)
+        {
+            break;
+        }
+
+        float2 Xi = Hammersley(SampleIndex, GParams.TotalSampleCount);
         float Phi = 2.0f * PI * Xi.x;
         float CosTheta = 1.0f - 2.0f * Xi.y;
         float SinTheta = sqrt(saturate(1.0f - CosTheta * CosTheta));
@@ -64,7 +70,7 @@ void MainCS()
 
         float3 Radiance = GEnvMap.SampleLevel(GSampler, Direction, 0).rgb;
 
-        // Evaluate the 3-band SH basis at the sample direction (index 0..8).
+        // Evaluate the 3-band SH basis at the sample direction.
         // Basis ordering matches FThreeBandSHVector / SHBasisFunction3 in SHE_Math.hlsli.
         float Y[9];
         {
@@ -88,23 +94,20 @@ void MainCS()
         }
     }
 
+    // Reduce across the whole group (one wave): no shared memory, no barrier.
     [unroll]
-    for (int CoeffOut = 0; CoeffOut < 9; ++CoeffOut)
+    for (int CoeffIndex = 0; CoeffIndex < 9; ++CoeffIndex)
     {
-        // Uniform sphere sampling has pdf 1/(4*pi), so the projection
-        // integral int L(s)*y_j(s) ds = mean(L*y_j) * 4*pi.
-        float3 c = SHRadiance[CoeffOut] * (4.0f * PI / float(NumSamples));
-
-        // Band index of this coefficient (0, 0, 0, 1, 1, 1, 2, 2, 2).
-        const int BandIndex[9] = {0, 0, 0, 1, 1, 1, 2, 2, 2};
-
-        // Convolve with the clamped cosine lobe in SH space so that the
-        // reconstruction sum_j (A_lj * c_j) * y_j(N) yields irradiance E(N).
-        float3 IrradianceCoeff = c * IrradianceBandA[BandIndex[CoeffOut]];
-
-        // Slots [34..42] follow the 33 SHE specular coefficients + 1 auto bias.
-        GSHESHCoeff[34 + CoeffOut] = float4(IrradianceCoeff, 0.0f);
+        SHRadiance[CoeffIndex] = WaveActiveSum(SHRadiance[CoeffIndex]);
     }
 
-    GSHESHCoeff[43] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    // Lane 0 writes the group partial: 9 consecutive float3 elements.
+    if (LaneIndex == 0)
+    {
+        [unroll]
+        for (int CoeffIndex = 0; CoeffIndex < 9; ++CoeffIndex)
+        {
+            GPartialRadiance[GroupID.x * 9 + CoeffIndex] = SHRadiance[CoeffIndex];
+        }
+    }
 }
