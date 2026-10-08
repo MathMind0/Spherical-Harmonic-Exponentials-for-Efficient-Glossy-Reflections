@@ -72,6 +72,14 @@ struct FStaticMesh
 	uint32_t BaseVertexLocation;
 };
 
+// Draw order of the IBL mode groups shown top-to-bottom in the sphere array.
+static const int GIBLModeGroupOrder[3] =
+{
+	IBL_MODE_SPHERICAL_HARMONICS_EXPONENTIAL,
+	IBL_MODE_REFERENCE,
+	IBL_MODE_SPLIT_SUM_APPROXIMATION,
+};
+
 struct FStaticMeshInstance
 {
 	XMFLOAT3 Position;
@@ -80,6 +88,7 @@ struct FStaticMeshInstance
 	float Roughness;
 	float RoughnessT;
 	float Metallic;
+	int IBLMode;
 };
 
 struct FDemoRoot
@@ -153,10 +162,8 @@ static void UpdateUI(FDemoRoot &Root, float DeltaTime)
 	}
 
 	{
-		Root.LastIBLMode = Root.IBLMode;
 		ImGui::Text("IBL Mode");
-		const char *items[] = {"Split Sum Approximation", "Spherical Harmonics Exponential (Specular Only)", "Reference"};
-		ImGui::Combo("##IBLMode", &(Root.IBLMode), items, IM_ARRAYSIZE(items));
+		ImGui::TextDisabled("SHE / Reference / Split-Sum (shown as 3 groups)");
 	}
 
 	{
@@ -224,7 +231,19 @@ static void Draw(FDemoRoot &Root)
 	CmdList->IASetIndexBuffer(&Root.StaticIBView);
 
 	const XMMATRIX ViewTransform = XMMatrixLookAtLH(XMLoadFloat3(&Root.CameraPosition), XMLoadFloat3(&Root.CameraFocusPosition), XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f));
-	const XMMATRIX ProjectionTransform = XMMatrixPerspectiveFovLH(XM_PI / 3, 1.777f, 0.1f, 100.0f);
+
+	// Orthographic projection: fit the 10x6 sphere grid with margin. Grid spans 22 x 13.2 units.
+	const float AspectRatio = 1.777f;
+	const float GridWidth = 10 * 2.2f;
+	const float GridHeight = 6 * 2.2f;
+	float ViewWidth = GridWidth + 4.0f;
+	float ViewHeight = ViewWidth / AspectRatio;
+	if (ViewHeight < GridHeight + 2.0f)
+	{
+		ViewHeight = GridHeight + 2.0f;
+		ViewWidth = ViewHeight * AspectRatio;
+	}
+	const XMMATRIX ProjectionTransform = XMMatrixOrthographicLH(ViewWidth, ViewHeight, 0.1f, 100.0f);
 
 	// Clear accumulation buffer if needed.
 	if (Root.LastMaterialMode != Root.MaterialMode || Root.LastIBLMode != Root.IBLMode)
@@ -254,7 +273,13 @@ static void Draw(FDemoRoot &Root)
 		CmdList->SetPipelineState(Root.Pipelines[PSO_SimpleForward]);
 		CmdList->SetGraphicsRootSignature(Root.RootSignatures[PSO_SimpleForward]);
 
-		// Per-frame constant data.
+		const XMMATRIX WorldToClip = ViewTransform * ProjectionTransform;
+
+		for (int32_t GroupIdx = 0; GroupIdx < 3; ++GroupIdx)
+		{
+		const int GroupIBLMode = GIBLModeGroupOrder[GroupIdx];
+
+		// Per-frame constant data (one per IBL mode group, only IBLMode differs).
 		{
 			D3D12_GPU_VIRTUAL_ADDRESS GPUAddress;
 			auto *CPUAddress = (FPerFrameConstantData *)AllocateGPUMemory(Gfx, sizeof(FPerFrameConstantData), GPUAddress);
@@ -272,7 +297,7 @@ static void Draw(FDemoRoot &Root)
 			const XMFLOAT3 P = Root.CameraPosition;
 			CPUAddress->ViewerPosition = XMFLOAT4(P.x, P.y, P.z, 1.0f);
 			CPUAddress->MaterialMode = Root.MaterialMode;
-			CPUAddress->IBLMode = Root.IBLMode;
+			CPUAddress->IBLMode = GroupIBLMode;
 			CPUAddress->NumFrames = Root.NumFrames;
 
 			CD3DX12_CPU_DESCRIPTOR_HANDLE TableBaseCPU;
@@ -312,11 +337,13 @@ static void Draw(FDemoRoot &Root)
 		D3D12_GPU_VIRTUAL_ADDRESS GPUAddress;
 		auto *CPUAddress = (FPerDrawConstantData *)AllocateGPUMemory(Gfx, NumMeshInstances * sizeof(FPerDrawConstantData), GPUAddress);
 
-		const XMMATRIX WorldToClip = ViewTransform * ProjectionTransform;
-
 		for (uint32_t MeshInstIdx = 0; MeshInstIdx < NumMeshInstances; ++MeshInstIdx)
 		{
 			const FStaticMeshInstance &MeshInst = Root.StaticMeshInstances[MeshInstIdx];
+			if (MeshInst.IBLMode != GroupIBLMode)
+			{
+				continue;
+			}
 			const FStaticMesh &Mesh = Root.StaticMeshes[MeshInst.MeshIndex];
 
 			const XMMATRIX ObjectToWorld =
@@ -342,6 +369,7 @@ static void Draw(FDemoRoot &Root)
 			GPUAddress += sizeof(FPerDrawConstantData);
 			CPUAddress++;
 		}
+		} // for each IBL mode group
 	}
 
 	// Copy color buffer to accumulation buffer.
@@ -1434,30 +1462,33 @@ static void Initialize(FDemoRoot &Root)
 			Root.StaticMeshes.push_back(FStaticMesh{Mesh.Sections[0].IndexCount, Mesh.Sections[0].StartIndexLocation, Mesh.Sections[0].BaseVertexLocation});
 		}
 
-		const int32_t NumRows = 5;
-		const int32_t NumColumns = 7;
-		float Metallic = 0.0f;
+		const int32_t NumRows = 6;    // 3 IBL groups x 2 metallic rows.
+		const int32_t NumColumns = 10; // Roughness from RoughnessStart to 1.
+		const float CellSize = 2.2f;
 		for (int32_t RowIdx = 0; RowIdx < NumRows; ++RowIdx)
 		{
-			float Roughness;
+			const int32_t GroupIdx = RowIdx / 2;
+			const int32_t MetallicIdx = RowIdx % 2;
+			const float Metallic = (float)MetallicIdx;
+			const int IBLMode = GIBLModeGroupOrder[GroupIdx];
+
 			for (int32_t ColumnIdx = 0; ColumnIdx < NumColumns; ++ColumnIdx)
 			{
 				float RoughnessT = (float)ColumnIdx / (NumColumns - 1);
-				Roughness = (1 - RoughnessT) * Root.RoughnessStart + RoughnessT * 1.0f;
+				float Roughness = (1 - RoughnessT) * Root.RoughnessStart + RoughnessT * 1.0f;
 
 				FStaticMeshInstance Instance = {};
-				float X = 2.2f * (-NumColumns * 0.5f + ColumnIdx + 0.5f);
-				float Y = 2.2f * (-NumRows * 0.5f + RowIdx + 0.5f);
+				float X = CellSize * (-NumColumns * 0.5f + ColumnIdx + 0.5f);
+				float Y = CellSize * (-NumRows * 0.5f + RowIdx + 0.5f);
 				Instance.Position = XMFLOAT3(X, Y, 0.0f);
 				Instance.MeshIndex = 1;
 				Instance.Roughness = Roughness;
 				Instance.RoughnessT = RoughnessT;
 				Instance.Metallic = Metallic;
+				Instance.IBLMode = IBLMode;
 
 				Root.StaticMeshInstances.push_back(Instance);
 			}
-			Metallic += 1.0f / (NumRows - 1);
-			Metallic = XMMin(Metallic, 1.0f);
 		}
 	}
 
