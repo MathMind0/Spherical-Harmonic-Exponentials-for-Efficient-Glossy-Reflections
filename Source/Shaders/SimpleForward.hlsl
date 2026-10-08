@@ -52,7 +52,18 @@ float3 FresnelSchlickRoughness(float CosTheta, float3 F0, float Roughness)
 		in float3 InNormalWS : _Normal,
 		out float4 OutColor : SV_Target0)
 {
-	float3 V = normalize(GPerFrameCB.ViewerPosition.xyz - InPositionWS);
+	// Orthographic projection: all view rays are parallel to the camera forward
+	// direction, so V is constant per pixel. Perspective projection: rays converge
+	// at the viewer position.
+	float3 V;
+	if (GPerFrameCB.bOrthographic)
+	{
+		V = -normalize(GPerFrameCB.ViewDirection.xyz);
+	}
+	else
+	{
+		V = normalize(GPerFrameCB.ViewerPosition.xyz - InPositionWS);
+	}
 	float3 N = normalize(InNormalWS);
 	float NoV = saturate(dot(N, V));
 
