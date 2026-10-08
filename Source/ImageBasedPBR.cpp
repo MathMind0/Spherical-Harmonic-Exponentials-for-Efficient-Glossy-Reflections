@@ -78,6 +78,7 @@ struct FStaticMeshInstance
 	XMFLOAT3 Rotation;
 	uint32_t MeshIndex;
 	float Roughness;
+	float RoughnessT;
 	float Metallic;
 };
 
@@ -124,6 +125,7 @@ struct FDemoRoot
 	int EnvironmentMapIndex;
 	int SelectedEnvironmentMapIndex;
 	int PendingEnvironmentMapIndex;
+	float RoughnessStart = 0.4f;
 	uint32_t NumSamples;
 	uint32_t NumFrames;
 };
@@ -165,6 +167,18 @@ static void UpdateUI(FDemoRoot &Root, float DeltaTime)
 			{
 				Root.PendingEnvironmentMapIndex = Root.SelectedEnvironmentMapIndex;
 			}
+		}
+	}
+
+	{
+		ImGui::Text("Roughness Range Start");
+		if (ImGui::SliderFloat("##RoughnessStart", &Root.RoughnessStart, 0.0f, 0.95f))
+		{
+			for (auto &Inst : Root.StaticMeshInstances)
+			{
+				Inst.Roughness = (1.0f - Inst.RoughnessT) * Root.RoughnessStart + Inst.RoughnessT * 1.0f;
+			}
+			Root.NumFrames = 0;
 		}
 	}
 
@@ -1428,7 +1442,8 @@ static void Initialize(FDemoRoot &Root)
 			float Roughness;
 			for (int32_t ColumnIdx = 0; ColumnIdx < NumColumns; ++ColumnIdx)
 			{
-				Roughness = (1 - (float)ColumnIdx / (NumColumns - 1)) * 0.4f + (float)ColumnIdx / (NumColumns - 1) * 1.0f;
+				float RoughnessT = (float)ColumnIdx / (NumColumns - 1);
+				Roughness = (1 - RoughnessT) * Root.RoughnessStart + RoughnessT * 1.0f;
 
 				FStaticMeshInstance Instance = {};
 				float X = 2.2f * (-NumColumns * 0.5f + ColumnIdx + 0.5f);
@@ -1436,6 +1451,7 @@ static void Initialize(FDemoRoot &Root)
 				Instance.Position = XMFLOAT3(X, Y, 0.0f);
 				Instance.MeshIndex = 1;
 				Instance.Roughness = Roughness;
+				Instance.RoughnessT = RoughnessT;
 				Instance.Metallic = Metallic;
 
 				Root.StaticMeshInstances.push_back(Instance);
