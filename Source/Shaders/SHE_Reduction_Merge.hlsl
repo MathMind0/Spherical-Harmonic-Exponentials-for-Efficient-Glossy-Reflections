@@ -35,21 +35,26 @@ void MainCS(
     }
 
     // compute Atb
-    for(uint Row = ThreadID.x; Row < GSHEReductionCB.SphericalHarmonicCount; Row += 32)
+    // NOTE: only threads with GroupThreadID.y == 0 do useful work here;
+    // all 32 rows of ThreadID.y would compute identical values otherwise.
+    if (GroupThreadID.y == 0)
     {
-        float SumR = 0;
-        float SumG = 0;
-        float SumB = 0;
-        for(uint i = 0; i < GSHEReductionCB.GroupCountZ; i++)
+        for(uint Row = ThreadID.x; Row < GSHEReductionCB.SphericalHarmonicCount; Row += 32)
         {
-            SumR += GSHEMatrixAT3D[uint3(Row, GSHEReductionCB.SphericalHarmonicCount    , i)];
-            SumG += GSHEMatrixAT3D[uint3(Row, GSHEReductionCB.SphericalHarmonicCount + 1, i)];
-            SumB += GSHEMatrixAT3D[uint3(Row, GSHEReductionCB.SphericalHarmonicCount + 2, i)];
-        }
+            float SumR = 0;
+            float SumG = 0;
+            float SumB = 0;
+            for(uint i = 0; i < GSHEReductionCB.GroupCountZ; i++)
+            {
+                SumR += GSHEMatrixAT3D[uint3(Row, GSHEReductionCB.SphericalHarmonicCount    , i)];
+                SumG += GSHEMatrixAT3D[uint3(Row, GSHEReductionCB.SphericalHarmonicCount + 1, i)];
+                SumB += GSHEMatrixAT3D[uint3(Row, GSHEReductionCB.SphericalHarmonicCount + 2, i)];
+            }
 
-        GSHEMatrixAT[uint2(Row, GSHEReductionCB.SphericalHarmonicCount    )] = SumR;
-        GSHEMatrixAT[uint2(Row, GSHEReductionCB.SphericalHarmonicCount + 1)] = SumG;
-        GSHEMatrixAT[uint2(Row, GSHEReductionCB.SphericalHarmonicCount + 2)] = SumB;
+            GSHEMatrixAT[uint2(Row, GSHEReductionCB.SphericalHarmonicCount    )] = SumR;
+            GSHEMatrixAT[uint2(Row, GSHEReductionCB.SphericalHarmonicCount + 1)] = SumG;
+            GSHEMatrixAT[uint2(Row, GSHEReductionCB.SphericalHarmonicCount + 2)] = SumB;
+        }
     }
 
 }

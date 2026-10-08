@@ -1050,7 +1050,7 @@ static void SHEReduction(FDemoRoot &Root, FGraphicsContext &Gfx, ID3D12Resource 
 		TableBaseCPU.Offset(Gfx.DescriptorSize);
 
 		CmdList->SetComputeRootDescriptorTable(0, TableBaseGPU);
-		CmdList->Dispatch(1, 1, GroupCountZ);
+		CmdList->Dispatch(1, 1, 1);
 
 		CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(
 										OutSHEMatrixAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)));
