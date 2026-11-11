@@ -9,7 +9,141 @@
 #include "stb_image.h"
 #include "cgltf.h"
 
+#include <math.h>
+#include <string.h>
+
 #define MESH_MAX_NUM_SECTIONS 4
+
+// SHE build grid: 8x8 view directions, 8x8 normals, 33 SH coefficients,
+// and 64 NormalCount rows per roughness slice.
+static const uint32_t GSHEViewCountSqrt = 8;
+static const uint32_t GSHENormalCountSqrt = 8;
+static const uint32_t GSHEViewCount = GSHEViewCountSqrt * GSHEViewCountSqrt;
+static const uint32_t GSHENormalCount = GSHENormalCountSqrt * GSHENormalCountSqrt;
+static const uint32_t GSHESphericalHarmonicCount = 33;
+static const uint32_t GSHECoeffLUTMaxGroups = 16; // Matches the UI max bake levels.
+static const uint32_t GSHECoeffPerGroup = 34;     // 33 specular + 1 autoBias float4.
+
+// The 33 specular coefficients grouped by SH band (order l).
+// P (5-band, indices 0..24): l0=1, l1=3, l2=5, l3=7, l4=9.
+// Q (3-band, indices 25..32, DC dropped): l1=3, l2=5.
+static const int GCoeffBandCount = 5;
+static const char *GCoeffBandLabels[5] = {"l=0", "l=1", "l=2", "l=3", "l=4"};
+static const int GCoeffBandCoeffCount[5] = {1, 6, 10, 7, 9};
+static const int GCoeffBandIndices[5][10] = {
+	{0, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+	{1, 2, 3, 25, 26, 27, -1, -1, -1, -1},
+	{4, 5, 6, 7, 8, 28, 29, 30, 31, 32},
+	{9, 10, 11, 12, 13, 14, 15, -1, -1, -1},
+	{16, 17, 18, 19, 20, 21, 22, 23, 24, -1},
+};
+
+// CPU-side copy of the grouped-fit coefficients, used by both the render path
+// (uploaded into the LUT buffer) and the ImGui variance table.
+struct FSHECoeffTable
+{
+	int Valid = 0;                      // 1 when the table has been computed at least once.
+	int BakeRoughnessCount = 0;         // Number of roughness groups baked when this table was built.
+	float RoughnessStart = 0.4f;        // Roughness of group 0.
+	float RoughnessEnd = 1.0f;          // Roughness of the last group.
+	// Index 0..N-1: per-roughness grouped fit. Index N: ungrouped (global) fit.
+	// Each Coeff[group] holds 34 float4 (33 specular + autoBias), only .xyz used.
+	float Coeff[GSHECoeffLUTMaxGroups + 1][GSHECoeffPerGroup][4];
+	// Squared deviation of each grouped fit's channel value from the ungrouped
+	// baseline, accumulated per band and in total. Computed for the UI table.
+	float BandVariance[GSHECoeffLUTMaxGroups][GCoeffBandCount]; // [group][band]; variance vs ungrouped baseline.
+	float TotalVariance[GSHECoeffLUTMaxGroups];    // [group]; variance over all 33 coefficients.
+};
+
+static float HalfToFloat(uint16_t H)
+{
+	const uint32_t Sign = (uint32_t)(H & 0x8000u) << 16;
+	uint32_t Exp = (uint32_t)((H >> 10) & 0x1Fu);
+	uint32_t Mant = (uint32_t)(H & 0x03FFu);
+	uint32_t F;
+	if (Exp == 0)
+	{
+		if (Mant == 0)
+		{
+			F = Sign;
+		}
+		else
+		{
+			// Subnormal: normalize.
+			Exp = 113;
+			while ((Mant & 0x0400u) == 0)
+			{
+				Mant <<= 1;
+				--Exp;
+			}
+			Mant &= 0x03FFu;
+			F = Sign | (Exp << 23) | (Mant << 13);
+		}
+	}
+	else if (Exp == 31)
+	{
+		F = Sign | 0x7F800000u | (Mant << 13); // Inf / NaN.
+	}
+	else
+	{
+		F = Sign | ((Exp + 112) << 23) | (Mant << 13);
+	}
+	float Result;
+	memcpy(&Result, &F, sizeof(Result));
+	return Result;
+}
+
+// Solve (A^T A + ridge*I) x = A^T b for a 33x33 symmetric positive system,
+// for three right-hand sides (RGB). AtA is shared across channels; Atb has 3.
+static void SolveGroupedFit(const float AtA[33][33], const float Atb[33][3], float OutX[33][3])
+{
+	const int N = 33;
+	float L[33][33] = {};
+	for (int i = 0; i < N; ++i)
+	{
+		for (int j = 0; j <= i; ++j)
+		{
+			float Sum = AtA[i][j];
+			for (int k = 0; k < j; ++k)
+			{
+				Sum -= L[i][k] * L[j][k];
+			}
+			if (i == j)
+			{
+				// Small ridge keeps the Cholesky factorization stable even
+				// for a single-roughness group (rank-deficient rows).
+				L[i][j] = sqrtf(fmaxf(Sum, 1e-4f));
+			}
+			else
+			{
+				L[i][j] = Sum / fmaxf(L[j][j], 1e-4f);
+			}
+		}
+	}
+	for (int Ch = 0; Ch < 3; ++Ch)
+	{
+		float Y[33];
+		for (int i = 0; i < N; ++i)
+		{
+			float Sum = Atb[i][Ch];
+			for (int j = 0; j < i; ++j)
+			{
+				Sum -= L[i][j] * Y[j];
+			}
+			Y[i] = Sum / fmaxf(L[i][i], 1e-4f);
+		}
+		for (int i = N - 1; i >= 0; --i)
+		{
+			float Sum = Y[i];
+			for (int j = i + 1; j < N; ++j)
+			{
+				Sum -= L[j][i] * OutX[j][Ch];
+			}
+			OutX[i][Ch] = Sum / fmaxf(L[i][i], 1e-4f);
+		}
+	}
+}
+
 
 static const char *GEnvironmentMapNames[] =
 {
@@ -135,6 +269,9 @@ struct FDemoRoot
 	ID3D12Resource *SHEMatrixb;
 	ID3D12Resource *SHEMatrixAT;
 	ID3D12Resource *SHESHCoeff;
+	ID3D12Resource *SHECoeffLUT;               // StructuredBuffer<float4>, flat [group*34 + i].
+	D3D12_CPU_DESCRIPTOR_HANDLE SHECoeffLUTSRV; // SRV bound at t5 in the SimpleForward descriptor table.
+	void *SHECoeffLUTMapped = nullptr;          // Persistently mapped CPU write pointer (upload heap).
 	D3D12_CPU_DESCRIPTOR_HANDLE EnvMapSRV;
 	D3D12_CPU_DESCRIPTOR_HANDLE IrradianceMapSRV;
 	D3D12_CPU_DESCRIPTOR_HANDLE PrefilteredEnvMapSRV;
@@ -156,13 +293,23 @@ struct FDemoRoot
 	int EnvironmentMapIndex;
 	int SelectedEnvironmentMapIndex;
 	int PendingEnvironmentMapIndex;
-	float RoughnessStart = 0.4f;
+	float RoughnessStart = 0.4f; // Display grid roughness sweep start (end fixed at 1.0).
+	float BakeRoughnessStart = 0.4f; // SHE bake roughness range start.
+	float BakeRoughnessEnd = 1.0f; // SHE bake roughness range end.
+	int BakeRoughnessCount = 4; // SHE bake roughness levels.
+	int PendingSHEBake = 0; // 1 = re-run the SHE precomputation with the current bake parameters.
+	bool bUseRoughnessLUT = false;  // ImGui toggle: render SHE with per-roughness grouped-fit coefficients.
+	bool bShowCoeffTable = true;    // ImGui toggle: show the grouped-fit coefficient / variance table.
+	FSHECoeffTable CoeffTable;      // CPU copy of the grouped-fit coefficients and their variance.
 	uint32_t NumSamples;
 	uint32_t NumFrames;
 	uint32_t WaveSize = 32; // GPU wave size in lanes (32 NVIDIA/Intel, 64 AMD), used to select SHE diffuse PSO variants.
 };
 
 static void RebuildEnvironment(FDemoRoot &Root);
+static void RebuildSHEBake(FDemoRoot &Root);
+static void ComputeGroupedSHEFit(FDemoRoot &Root);
+static void DrawSHECoeffTable(FDemoRoot &Root);
 
 static void UpdateUI(FDemoRoot &Root, float DeltaTime)
 {
@@ -204,7 +351,8 @@ static void UpdateUI(FDemoRoot &Root, float DeltaTime)
 	}
 
 	{
-		ImGui::Text("Roughness Range Start");
+		ImGui::Text("Display Roughness Start");
+		ImGui::TextDisabled("Sphere grid sweep, up to 1.0");
 		if (ImGui::SliderFloat("##RoughnessStart", &Root.RoughnessStart, 0.0f, 0.95f))
 		{
 			for (auto &Inst : Root.StaticMeshInstances)
@@ -213,6 +361,50 @@ static void UpdateUI(FDemoRoot &Root, float DeltaTime)
 			}
 			Root.NumFrames = 0;
 		}
+	}
+
+	{
+		// SHE bake roughness range and level count. The SHE precomputation is
+		// re-run once the user releases a control (end of edit).
+		ImGui::Text("SHE Bake Roughness Range");
+		ImGui::TextDisabled("Range and levels baked into the SHE matrices");
+		bool bBakeDirty = false;
+		const float MinRange = 0.01f;
+
+		ImGui::SliderFloat("##BakeRoughnessStart", &Root.BakeRoughnessStart, 0.0f, 1.0f - MinRange, "Start %.2f");
+		Root.BakeRoughnessStart = XMMin(Root.BakeRoughnessStart, Root.BakeRoughnessEnd - MinRange);
+		if (ImGui::IsItemDeactivatedAfterEdit())
+		{
+			bBakeDirty = true;
+		}
+
+		ImGui::SliderFloat("##BakeRoughnessEnd", &Root.BakeRoughnessEnd, MinRange, 1.0f, "End %.2f");
+		Root.BakeRoughnessEnd = XMMax(Root.BakeRoughnessEnd, Root.BakeRoughnessStart + MinRange);
+		if (ImGui::IsItemDeactivatedAfterEdit())
+		{
+			bBakeDirty = true;
+		}
+
+		ImGui::SliderInt("##BakeRoughnessCount", &Root.BakeRoughnessCount, 1, 16, "Levels %d");
+		if (ImGui::IsItemDeactivatedAfterEdit())
+		{
+			bBakeDirty = true;
+		}
+
+		ImGui::TextDisabled("SHE rebake runs on slider release");
+
+		if (bBakeDirty)
+		{
+			Root.PendingSHEBake = 1;
+		}
+	}
+
+	{
+		ImGui::Text("Roughness LUT");
+		ImGui::Checkbox("Use per-group SHE fit (LUT)", &Root.bUseRoughnessLUT);
+		ImGui::TextDisabled("Grouped-fit coefficients drive the SHE render");
+		ImGui::Checkbox("Show coefficient table", &Root.bShowCoeffTable);
+		ImGui::TextDisabled("Coefficients by band + variance vs ungrouped");
 	}
 
 	{
@@ -233,6 +425,11 @@ static void UpdateUI(FDemoRoot &Root, float DeltaTime)
 	}
 
 	ImGui::End();
+
+	if (Root.bShowCoeffTable)
+	{
+		DrawSHECoeffTable(Root);
+	}
 }
 
 static void Update(FDemoRoot &Root)
@@ -244,7 +441,17 @@ static void Update(FDemoRoot &Root)
 
 	if (Root.PendingEnvironmentMapIndex >= 0)
 	{
+		// The environment rebuild already re-runs the SHE bake with the
+		// current parameters, so drop any pending bake-only rebuild.
+		Root.PendingSHEBake = 0;
 		RebuildEnvironment(Root);
+	}
+	else if (Root.PendingSHEBake)
+	{
+		// Re-run the SHE precomputation when the bake roughness range or
+		// level count changed in the UI.
+		Root.PendingSHEBake = 0;
+		RebuildSHEBake(Root);
 	}
 
 	// Mouse orbit camera control: left-drag to rotate, wheel to zoom.
@@ -486,10 +693,14 @@ static void Draw(FDemoRoot &Root)
 			CPUAddress->MaterialMode = Root.MaterialMode;
 			CPUAddress->IBLMode = GroupIBLMode;
 			CPUAddress->NumFrames = Root.NumFrames;
+			CPUAddress->bUseRoughnessLUT = (Root.bUseRoughnessLUT && Root.CoeffTable.Valid) ? 1 : 0;
+			CPUAddress->SHECoeffLUTCount = Root.CoeffTable.Valid ? Root.CoeffTable.BakeRoughnessCount : 0;
+			CPUAddress->SHECoeffLUTRoughnessStart = Root.CoeffTable.RoughnessStart;
+			CPUAddress->SHECoeffLUTRoughnessEnd = Root.CoeffTable.RoughnessEnd;
 
 			CD3DX12_CPU_DESCRIPTOR_HANDLE TableBaseCPU;
 			CD3DX12_GPU_DESCRIPTOR_HANDLE TableBaseGPU;
-			AllocateGPUDescriptors(Gfx, 7, TableBaseCPU, TableBaseGPU);
+			AllocateGPUDescriptors(Gfx, 8, TableBaseCPU, TableBaseGPU);
 
 			D3D12_CONSTANT_BUFFER_VIEW_DESC CBVDesc = {};
 			CBVDesc.BufferLocation = GPUAddress;
@@ -514,6 +725,9 @@ static void Draw(FDemoRoot &Root)
 			TableBaseCPU.Offset(Gfx.DescriptorSize);
 
 			Gfx.Device->CopyDescriptorsSimple(1, TableBaseCPU, Root.AccumulationBufferSRV, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+			TableBaseCPU.Offset(Gfx.DescriptorSize);
+
+			Gfx.Device->CopyDescriptorsSimple(1, TableBaseCPU, Root.SHECoeffLUTSRV, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 			TableBaseCPU.Offset(Gfx.DescriptorSize);
 
 			CmdList->SetGraphicsRootDescriptorTable(1, TableBaseGPU);
@@ -1138,13 +1352,13 @@ static void CreateBRDFIntegrationMap(FGraphicsContext &Gfx, ID3D12Resource *&Out
 	Gfx.CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(OutBRDFIntegrationMap, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)));
 }
 
-static void SHEBuild(FGraphicsContext &Gfx, ID3D12Resource *&OutSHEMatrixA, ID3D12Resource *&OutSHEMatrixb, D3D12_CPU_DESCRIPTOR_HANDLE &OutSHEMatrixASRV, D3D12_CPU_DESCRIPTOR_HANDLE &OutSHEMatrixbSRV, D3D12_CPU_DESCRIPTOR_HANDLE EnvMapSRV)
+static void SHEBuild(const FDemoRoot &Root, FGraphicsContext &Gfx, ID3D12Resource *&OutSHEMatrixA, ID3D12Resource *&OutSHEMatrixb, D3D12_CPU_DESCRIPTOR_HANDLE &OutSHEMatrixASRV, D3D12_CPU_DESCRIPTOR_HANDLE &OutSHEMatrixbSRV, D3D12_CPU_DESCRIPTOR_HANDLE EnvMapSRV)
 {
 	const uint32_t ViewCountSqrt = 8;
 	const uint32_t NormalCountSqrt = 8;
 	const uint32_t ViewCount = ViewCountSqrt * ViewCountSqrt;
 	const uint32_t NormalCount = NormalCountSqrt * NormalCountSqrt;
-	const uint32_t RoughnessCount = 4;
+	const uint32_t RoughnessCount = (uint32_t)Root.BakeRoughnessCount;
 	const uint32_t SphericalHarmonicCount = 33; // 25(SH5) + 9(SH3) - 1(DC)
 
 	const D3D12_CPU_DESCRIPTOR_HANDLE TempSHEMatrixAUAV = AllocateDescriptors(Gfx, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
@@ -1178,6 +1392,8 @@ static void SHEBuild(FGraphicsContext &Gfx, ID3D12Resource *&OutSHEMatrixA, ID3D
 	CPUAddress->NormalCountSqrt = NormalCountSqrt;
 	CPUAddress->RoughnessCount = RoughnessCount;
 	CPUAddress->SphericalHarmonicCount = SphericalHarmonicCount;
+	CPUAddress->RoughnessStart = Root.BakeRoughnessStart;
+	CPUAddress->RoughnessEnd = Root.BakeRoughnessEnd;
 
 	CD3DX12_CPU_DESCRIPTOR_HANDLE TableBaseCPU;
 	CD3DX12_GPU_DESCRIPTOR_HANDLE TableBaseGPU;
@@ -1200,13 +1416,15 @@ static void SHEBuild(FGraphicsContext &Gfx, ID3D12Resource *&OutSHEMatrixA, ID3D
 	TableBaseCPU.Offset(Gfx.DescriptorSize);
 
 	CmdList->SetComputeRootDescriptorTable(0, TableBaseGPU);
-	CmdList->Dispatch(8, 8, 4);
+
+	CmdList->SetComputeRootDescriptorTable(0, TableBaseGPU);
+	CmdList->Dispatch(8, 8, RoughnessCount);
 
 	CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(
-									OutSHEMatrixA, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)));
+OutSHEMatrixA, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)));
 
 	CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(
-									OutSHEMatrixb, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)));
+OutSHEMatrixb, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)));
 }
 
 static void SHEReduction(FDemoRoot &Root, FGraphicsContext &Gfx, ID3D12Resource *&OutSHEMatrixAT, D3D12_CPU_DESCRIPTOR_HANDLE &OutSHEMatrixATSRV, D3D12_CPU_DESCRIPTOR_HANDLE SHEMatrixASRV, D3D12_CPU_DESCRIPTOR_HANDLE SHEMatrixbSRV,
@@ -1216,7 +1434,7 @@ static void SHEReduction(FDemoRoot &Root, FGraphicsContext &Gfx, ID3D12Resource 
 	const uint32_t NormalCountSqrt = 8;
 	const uint32_t ViewCount = ViewCountSqrt * ViewCountSqrt;
 	const uint32_t NormalCount = NormalCountSqrt * NormalCountSqrt;
-	const uint32_t RoughnessCount = 4;
+	const uint32_t RoughnessCount = (uint32_t)Root.BakeRoughnessCount;
 	const uint32_t SphericalHarmonicCount = 33; // 25(SH5) + 9(SH3) - 1(DC)
 	const uint32_t GroupCountZ = 64;
 
@@ -1275,10 +1493,12 @@ static void SHEReduction(FDemoRoot &Root, FGraphicsContext &Gfx, ID3D12Resource 
 	TableBaseCPU.Offset(Gfx.DescriptorSize);
 
 	CmdList->SetComputeRootDescriptorTable(0, TableBaseGPU);
+
+	CmdList->SetComputeRootDescriptorTable(0, TableBaseGPU);
 	CmdList->Dispatch(1, 1, GroupCountZ);
 
 	CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(
-									TempSHEMatrixAT3D, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)));
+TempSHEMatrixAT3D, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)));
 
 	// Merge
 	Gfx.CmdList->SetPipelineState(Root.Pipelines[PSO_SHE_Reduction_Merge]);
@@ -1324,7 +1544,7 @@ static void SHEReduction(FDemoRoot &Root, FGraphicsContext &Gfx, ID3D12Resource 
 		CmdList->Dispatch(1, 1, 1);
 
 		CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(
-										OutSHEMatrixAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)));
+OutSHEMatrixAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)));
 	}
 }
 
@@ -1364,13 +1584,13 @@ static void SHESolve(FGraphicsContext &Gfx, ID3D12Resource *&OutSHESHCoeff, D3D1
 	CmdList->Dispatch(1, 1, 1);
 }
 
-static void SHECalibrate(FGraphicsContext &Gfx, ID3D12Resource *SHESHCoeff, D3D12_CPU_DESCRIPTOR_HANDLE SHEMatrixASRV, D3D12_CPU_DESCRIPTOR_HANDLE SHEMatrixbSRV)
+static void SHECalibrate(const FDemoRoot &Root, FGraphicsContext &Gfx, ID3D12Resource *SHESHCoeff, D3D12_CPU_DESCRIPTOR_HANDLE SHEMatrixASRV, D3D12_CPU_DESCRIPTOR_HANDLE SHEMatrixbSRV)
 {
 	const uint32_t ViewCountSqrt = 8;
 	const uint32_t NormalCountSqrt = 8;
 	const uint32_t ViewCount = ViewCountSqrt * ViewCountSqrt;
 	const uint32_t NormalCount = NormalCountSqrt * NormalCountSqrt;
-	const uint32_t RoughnessCount = 4;
+	const uint32_t RoughnessCount = (uint32_t)Root.BakeRoughnessCount;
 	const uint32_t SphericalHarmonicCount = 33;
 
 	const D3D12_CPU_DESCRIPTOR_HANDLE TempSHESHCoeffUAV = AllocateDescriptors(Gfx, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
@@ -1516,8 +1736,10 @@ static void SHEDiffuse(FDemoRoot &Root, FGraphicsContext &Gfx, ID3D12Resource *S
 		CmdList->Dispatch(GroupCount, 1, 1);
 	}
 
-	// UAV barrier: all stage-1 writes must complete before stage 2 reads.
-	CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::UAV(PartialRadiance)));
+	// Transition out of UAV: flushes all stage-1 writes and puts the buffer into a
+	// shader-resource state so stage 2 can read it from a compute shader.
+	CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(
+		PartialRadiance, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)));
 
 	// Stage 2: sum partials, convolve, write back.
 	{
@@ -1544,6 +1766,365 @@ static void SHEDiffuse(FDemoRoot &Root, FGraphicsContext &Gfx, ID3D12Resource *S
 
 	CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(
 									SHESHCoeff, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)));
+}
+
+// Create the persistently-mapped upload buffer that holds the per-roughness
+// grouped-fit coefficients (StructuredBuffer<float4>, flat [group*34 + i]).
+static void CreateSHECoeffLUTResources(FDemoRoot &Root)
+{
+	FGraphicsContext &Gfx = Root.Gfx;
+	const uint32_t NumFloat4 = GSHECoeffLUTMaxGroups * GSHECoeffPerGroup; // 16 * 34 = 544
+	const UINT64 BufferSize = (UINT64)NumFloat4 * sizeof(float4);
+	const D3D12_RESOURCE_DESC Desc = CD3DX12_RESOURCE_DESC::Buffer(BufferSize);
+	VHR(Gfx.Device->CreateCommittedResource(
+		get_rvalue_ptr(CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD)), D3D12_HEAP_FLAG_NONE,
+		&Desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&Root.SHECoeffLUT)));
+	CD3DX12_RANGE ReadRange(0, 0);
+	VHR(Root.SHECoeffLUT->Map(0, &ReadRange, &Root.SHECoeffLUTMapped));
+	memset(Root.SHECoeffLUTMapped, 0, (size_t)BufferSize);
+
+	Root.SHECoeffLUTSRV = AllocateDescriptors(Gfx, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
+	D3D12_SHADER_RESOURCE_VIEW_DESC S = {};
+	S.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+	S.Format = DXGI_FORMAT_UNKNOWN;
+	S.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	S.Buffer.NumElements = NumFloat4;
+	S.Buffer.StructureByteStride = sizeof(float4);
+	Gfx.Device->CreateShaderResourceView(Root.SHECoeffLUT, &S, Root.SHECoeffLUTSRV);
+}
+
+// Read back the baked SHE matrices and solve a separate 33-coefficient fit for
+// each roughness group, plus one ungrouped (global) fit used as the baseline.
+// Results fill Root.CoeffTable and are uploaded into the LUT buffer.
+// Height row layout (SHE_Build.hlsl): height = NormalIndex + RoughnessIndex*64,
+// so group g owns rows [g*64, g*64+63].
+static void ComputeGroupedSHEFit(FDemoRoot &Root)
+{
+	FGraphicsContext &Gfx = Root.Gfx;
+	const uint32_t RoughnessCount = (uint32_t)(Root.BakeRoughnessCount > 0 ? Root.BakeRoughnessCount : 1);
+	const uint32_t TotalHeight = GSHENormalCount * RoughnessCount;
+
+	FSHECoeffTable &Table = Root.CoeffTable;
+	memset(&Table, 0, sizeof(Table));
+	Table.BakeRoughnessCount = (int)RoughnessCount;
+	Table.RoughnessStart = Root.BakeRoughnessStart;
+	Table.RoughnessEnd = Root.BakeRoughnessEnd;
+
+	// Footprints for copying the two textures into CPU-visible readback buffers.
+	const D3D12_RESOURCE_DESC ADesc = Root.SHEMatrixA->GetDesc();
+	const D3D12_RESOURCE_DESC bDesc = Root.SHEMatrixb->GetDesc();
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT AFoot = {}, bFoot = {};
+	UINT64 ASize = 0, bSize = 0;
+	Gfx.Device->GetCopyableFootprints(&ADesc, 0, 1, 0, &AFoot, nullptr, nullptr, &ASize);
+	Gfx.Device->GetCopyableFootprints(&bDesc, 0, 1, 0, &bFoot, nullptr, nullptr, &bSize);
+
+	ID3D12Resource *ReadA = nullptr, *Readb = nullptr;
+	VHR(Gfx.Device->CreateCommittedResource(
+		get_rvalue_ptr(CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK)), D3D12_HEAP_FLAG_NONE,
+		get_rvalue_ptr(CD3DX12_RESOURCE_DESC::Buffer(ASize)), D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&ReadA)));
+	VHR(Gfx.Device->CreateCommittedResource(
+		get_rvalue_ptr(CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK)), D3D12_HEAP_FLAG_NONE,
+		get_rvalue_ptr(CD3DX12_RESOURCE_DESC::Buffer(bSize)), D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&Readb)));
+
+	ID3D12GraphicsCommandList2 *CmdList = GetAndInitCommandList(Gfx);
+	{
+		const CD3DX12_RESOURCE_BARRIER ToCopy[2] = {
+			CD3DX12_RESOURCE_BARRIER::Transition(Root.SHEMatrixA, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+			CD3DX12_RESOURCE_BARRIER::Transition(Root.SHEMatrixb, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+		};
+		CmdList->ResourceBarrier(2, ToCopy);
+
+		const CD3DX12_TEXTURE_COPY_LOCATION SrcA(Root.SHEMatrixA, 0);
+		const CD3DX12_TEXTURE_COPY_LOCATION Srcb(Root.SHEMatrixb, 0);
+		const CD3DX12_TEXTURE_COPY_LOCATION DstA(ReadA, AFoot);
+		const CD3DX12_TEXTURE_COPY_LOCATION Dstb(Readb, bFoot);
+		CmdList->CopyTextureRegion(&DstA, 0, 0, 0, &SrcA, nullptr);
+		CmdList->CopyTextureRegion(&Dstb, 0, 0, 0, &Srcb, nullptr);
+
+		const CD3DX12_RESOURCE_BARRIER ToSRV[2] = {
+			CD3DX12_RESOURCE_BARRIER::Transition(Root.SHEMatrixA, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+			CD3DX12_RESOURCE_BARRIER::Transition(Root.SHEMatrixb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+		};
+		CmdList->ResourceBarrier(2, ToSRV);
+	}
+	CmdList->Close();
+	Gfx.CmdQueue->ExecuteCommandLists(1, CommandListCast(&Gfx.CmdList));
+	WaitForGPU(Gfx);
+
+	void *MappedA = nullptr, *Mappedb = nullptr;
+	ReadA->Map(0, nullptr, &MappedA);
+	Readb->Map(0, nullptr, &Mappedb);
+	const uint8_t *ABase = (const uint8_t *)MappedA + AFoot.Offset;
+	const uint8_t *bBase = (const uint8_t *)Mappedb + bFoot.Offset;
+	const UINT ARowPitch = AFoot.Footprint.RowPitch;
+	const UINT bRowPitch = bFoot.Footprint.RowPitch;
+
+	// Global (ungrouped) normal-equation accumulators, summed across every row.
+	float GAtA[33][33] = {};
+	float GAtb[33][3] = {};
+
+	for (uint32_t g = 0; g < RoughnessCount; ++g)
+	{
+		float AtA[33][33] = {};
+		float Atb[33][3] = {};
+		for (uint32_t h = g * GSHENormalCount; h < (g + 1) * GSHENormalCount; ++h)
+		{
+			const float *ARow = (const float *)(ABase + (size_t)h * ARowPitch);
+			const uint16_t *bRow = (const uint16_t *)(bBase + (size_t)h * bRowPitch);
+			for (uint32_t v = 0; v < GSHEViewCount; ++v)
+			{
+				const float *a = ARow + v * GSHESphericalHarmonicCount;
+				float blog[3];
+				for (int c = 0; c < 3; ++c)
+				{
+					blog[c] = HalfToFloat(bRow[v * 4 + c]);
+				}
+				for (int i = 0; i < 33; ++i)
+				{
+					for (int j = 0; j <= i; ++j)
+					{
+						const float p = a[i] * a[j];
+						AtA[i][j] += p;
+						GAtA[i][j] += p;
+					}
+					for (int c = 0; c < 3; ++c)
+					{
+						const float q = a[i] * blog[c];
+						Atb[i][c] += q;
+						GAtb[i][c] += q;
+					}
+				}
+			}
+		}
+		for (int i = 0; i < 33; ++i)
+		{
+			AtA[i][i] += 1e-2f; // ridge
+		}
+		float X[33][3] = {};
+		SolveGroupedFit(AtA, Atb, X);
+
+		// Per-group log-space energy calibration (autoBias), mirroring
+		// SHE_Calibrate.hlsl but restricted to this group's rows.
+		float Target[3] = {}, Recon[3] = {};
+		for (uint32_t h = g * GSHENormalCount; h < (g + 1) * GSHENormalCount; ++h)
+		{
+			const float *ARow = (const float *)(ABase + (size_t)h * ARowPitch);
+			const uint16_t *bRow = (const uint16_t *)(bBase + (size_t)h * bRowPitch);
+			for (uint32_t v = 0; v < GSHEViewCount; ++v)
+			{
+				const float *a = ARow + v * GSHESphericalHarmonicCount;
+				for (int c = 0; c < 3; ++c)
+				{
+					float LogRecon = 0.0f;
+					for (int i = 0; i < 33; ++i)
+					{
+						LogRecon += a[i] * X[i][c];
+					}
+					Target[c] += expf(HalfToFloat(bRow[v * 4 + c]));
+					Recon[c] += expf(fmaxf(LogRecon, -20.0f));
+				}
+			}
+		}
+		for (int i = 0; i < 33; ++i)
+		{
+			for (int c = 0; c < 3; ++c)
+			{
+				Table.Coeff[g][i][c] = X[i][c];
+			}
+		}
+		for (int c = 0; c < 3; ++c)
+		{
+			Table.Coeff[g][33][c] = logf(fmaxf(Target[c], 1e-6f) / fmaxf(Recon[c], 1e-6f));
+		}
+	}
+
+	// Ungrouped baseline fit (last table row).
+	for (int i = 0; i < 33; ++i)
+	{
+		GAtA[i][i] += 1e-2f;
+	}
+	float GX[33][3] = {};
+	SolveGroupedFit(GAtA, GAtb, GX);
+	{
+		float Target[3] = {}, Recon[3] = {};
+		for (uint32_t h = 0; h < TotalHeight; ++h)
+		{
+			const float *ARow = (const float *)(ABase + (size_t)h * ARowPitch);
+			const uint16_t *bRow = (const uint16_t *)(bBase + (size_t)h * bRowPitch);
+			for (uint32_t v = 0; v < GSHEViewCount; ++v)
+			{
+				const float *a = ARow + v * GSHESphericalHarmonicCount;
+				for (int c = 0; c < 3; ++c)
+				{
+					float LogRecon = 0.0f;
+					for (int i = 0; i < 33; ++i)
+					{
+						LogRecon += a[i] * GX[i][c];
+					}
+					Target[c] += expf(HalfToFloat(bRow[v * 4 + c]));
+					Recon[c] += expf(fmaxf(LogRecon, -20.0f));
+				}
+			}
+		}
+		for (int i = 0; i < 33; ++i)
+		{
+			for (int c = 0; c < 3; ++c)
+			{
+				Table.Coeff[RoughnessCount][i][c] = GX[i][c];
+			}
+		}
+		for (int c = 0; c < 3; ++c)
+		{
+			Table.Coeff[RoughnessCount][33][c] = logf(fmaxf(Target[c], 1e-6f) / fmaxf(Recon[c], 1e-6f));
+		}
+	}
+
+	ReadA->Unmap(0, nullptr);
+	Readb->Unmap(0, nullptr);
+	SAFE_RELEASE(ReadA);
+	SAFE_RELEASE(Readb);
+
+	// Mean squared deviation of each grouped row vs the ungrouped baseline,
+	// per band (over RGB) and over all 33 coefficients.
+	for (uint32_t g = 0; g < RoughnessCount; ++g)
+	{
+		float TotalSum = 0.0f;
+		int TotalN = 0;
+		for (int b = 0; b < GCoeffBandCount; ++b)
+		{
+			float BandSum = 0.0f;
+			int BandN = 0;
+			for (int k = 0; k < GCoeffBandCoeffCount[b]; ++k)
+			{
+				const int Idx = GCoeffBandIndices[b][k];
+				for (int c = 0; c < 3; ++c)
+				{
+					const float d = Table.Coeff[g][Idx][c] - Table.Coeff[RoughnessCount][Idx][c];
+					BandSum += d * d;
+					++BandN;
+				}
+			}
+			Table.BandVariance[g][b] = BandN > 0 ? BandSum / BandN : 0.0f;
+			TotalSum += BandSum;
+			TotalN += BandN;
+		}
+		Table.TotalVariance[g] = TotalN > 0 ? TotalSum / TotalN : 0.0f;
+	}
+
+	// Upload grouped coefficients into the persistently mapped LUT buffer.
+	if (Root.SHECoeffLUTMapped)
+	{
+		float4 *LUT = (float4 *)Root.SHECoeffLUTMapped;
+		for (uint32_t g = 0; g < RoughnessCount; ++g)
+		{
+			for (int i = 0; i < 34; ++i)
+			{
+				LUT[g * 34 + i] = XMFLOAT4(Table.Coeff[g][i][0], Table.Coeff[g][i][1], Table.Coeff[g][i][2], 0.0f);
+			}
+		}
+	}
+	Table.Valid = 1;
+	Root.NumFrames = 0;
+}
+
+// ImGui table: one row per roughness group (+ ungrouped baseline), 33 SHE
+// coefficients grouped by SH band, with per-band and total variance vs the
+// ungrouped fit. Uses ImGui 1.72 legacy Columns API.
+static void DrawSHECoeffTable(FDemoRoot &Root)
+{
+	ImGui::SetNextWindowSize(ImVec2(1180.0f, 460.0f), ImGuiCond_FirstUseEver);
+	ImGui::SetNextWindowContentWidth(1480.0f);
+	if (!ImGui::Begin("SHE Grouped-Fit Coefficients", &Root.bShowCoeffTable, ImGuiWindowFlags_HorizontalScrollbar))
+	{
+		ImGui::End();
+		return;
+	}
+	const FSHECoeffTable &T = Root.CoeffTable;
+	if (!T.Valid)
+	{
+		ImGui::TextDisabled("No grouped fit available yet (waiting for first bake).");
+		ImGui::End();
+		return;
+	}
+	const int N = T.BakeRoughnessCount;
+	ImGui::Text("Groups: %d   Bake range: [%.2f, %.2f]", N, T.RoughnessStart, T.RoughnessEnd);
+	ImGui::TextDisabled("Cells show the 33 coefficients (luma) grouped by SH band; v= per-band MSE vs ungrouped; last column = total MSE.");
+
+	const int NumCols = 1 + GCoeffBandCount + 1;
+	ImGui::Columns(NumCols, "shecoefftable", true);
+	ImGui::SetColumnWidth(0, 96.0f);
+	for (int b = 0; b < GCoeffBandCount; ++b)
+	{
+		ImGui::SetColumnWidth(1 + b, 244.0f);
+	}
+	ImGui::SetColumnWidth(1 + GCoeffBandCount, 84.0f);
+
+	ImGui::TextDisabled("Group");
+	ImGui::NextColumn();
+	for (int b = 0; b < GCoeffBandCount; ++b)
+	{
+		ImGui::TextDisabled("%s (%d)", GCoeffBandLabels[b], GCoeffBandCoeffCount[b]);
+		ImGui::NextColumn();
+	}
+	ImGui::TextDisabled("TotalVar");
+	ImGui::NextColumn();
+	ImGui::Separator();
+
+	char Buf[512];
+	for (int Row = 0; Row <= N; ++Row)
+	{
+		const bool bBaseline = (Row == N);
+		if (bBaseline)
+		{
+			ImGui::Text("Ungrouped");
+		}
+		else
+		{
+			const float Denom = (float)(N > 1 ? N - 1 : 1);
+			const float R = T.RoughnessStart + (float)Row / Denom * (T.RoughnessEnd - T.RoughnessStart);
+			ImGui::Text("R=%.2f", R);
+		}
+		ImGui::NextColumn();
+
+		for (int b = 0; b < GCoeffBandCount; ++b)
+		{
+			char *p = Buf;
+			size_t Rem = sizeof(Buf);
+			for (int k = 0; k < GCoeffBandCoeffCount[b]; ++k)
+			{
+				const int Idx = GCoeffBandIndices[b][k];
+				const float Luma = (T.Coeff[Row][Idx][0] + T.Coeff[Row][Idx][1] + T.Coeff[Row][Idx][2]) / 3.0f;
+				const int Written = EA::StdC::Snprintf(p, Rem, "%.2f ", Luma);
+				if (Written < 0 || (size_t)Written >= Rem)
+				{
+					break;
+				}
+				p += Written;
+				Rem -= Written;
+			}
+			ImGui::TextWrapped("%s", Buf);
+			if (bBaseline)
+			{
+				ImGui::TextDisabled("baseline");
+			}
+			else
+			{
+				ImGui::TextDisabled("v=%.3g", T.BandVariance[Row][b]);
+			}
+			ImGui::NextColumn();
+		}
+		if (bBaseline)
+		{
+			ImGui::TextDisabled("-");
+		}
+		else
+		{
+			ImGui::Text("%.3g", T.TotalVariance[Row]);
+		}
+		ImGui::NextColumn();
+	}
+	ImGui::Columns(1);
+	ImGui::End();
 }
 
 static void ReleaseEnvironmentResources(FDemoRoot &Root)
@@ -1575,10 +2156,17 @@ static void RecordEnvironmentPrecomputation(FDemoRoot &Root, eastl::vector<ID3D1
 	Gfx.CmdList->SetGraphicsRootSignature(Root.RootSignatures[PSO_GenerateIrradianceMap]);
 	CreateIrradianceMap(Root.Gfx, Root.EnvMapSRV, Root.StaticMeshes[MESH_Cube], Root.IrradianceMap, Root.IrradianceMapSRV, TempResources);
 
+	// The SHE passes sample the environment map from compute shaders. Allow both
+	// pixel and non-pixel SRV reads for the duration of the SHE section; restore the
+	// pixel-only state afterwards because the mipmap generator requires it exactly.
+	Gfx.CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(
+		Root.EnvMap, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)));
+
 	// SHE Build.
 	Gfx.CmdList->SetPipelineState(Root.Pipelines[PSO_SHE_Build]);
 	Gfx.CmdList->SetComputeRootSignature(Root.RootSignatures[PSO_SHE_Build]);
-	SHEBuild(Gfx, Root.SHEMatrixA, Root.SHEMatrixb, Root.SHEMatrixASRV, Root.SHEMatrixbSRV, Root.EnvMapSRV);
+	SHEBuild(Root, Gfx, Root.SHEMatrixA, Root.SHEMatrixb, Root.SHEMatrixASRV, Root.SHEMatrixbSRV, Root.EnvMapSRV);
 
 	// SHE Reduction.
 	Gfx.CmdList->SetPipelineState(Root.Pipelines[PSO_SHE_Reduction]);
@@ -1593,11 +2181,15 @@ static void RecordEnvironmentPrecomputation(FDemoRoot &Root, eastl::vector<ID3D1
 	// SHE log-space brightness calibration.
 	Gfx.CmdList->SetPipelineState(Root.Pipelines[PSO_SHE_Calibrate]);
 	Gfx.CmdList->SetComputeRootSignature(Root.RootSignatures[PSO_SHE_Calibrate]);
-	SHECalibrate(Gfx, Root.SHESHCoeff, Root.SHEMatrixASRV, Root.SHEMatrixbSRV);
+	SHECalibrate(Root, Gfx, Root.SHESHCoeff, Root.SHEMatrixASRV, Root.SHEMatrixbSRV);
 
 	// 3-band SH diffuse irradiance from the environment map (two-stage
 	// dispatch; PSOs are set inside SHEDiffuse per stage).
 	SHEDiffuse(Root, Gfx, Root.SHESHCoeff, Root.EnvMapSRV, TempResources);
+
+	Gfx.CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(
+		Root.EnvMap, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)));
 }
 
 static void FinishEnvironmentPrecomputation(FDemoRoot &Root, eastl::vector<ID3D12Resource *> &TempResources, eastl::vector<ID3D12Resource *> &TexturesThatNeedMipmaps)
@@ -1642,6 +2234,10 @@ static void FinishEnvironmentPrecomputation(FDemoRoot &Root, eastl::vector<ID3D1
 	{
 		DestroyMipmapGenerator(MipmapGenerators[Idx]);
 	}
+
+	// Build the grouped-fit LUT and coefficient table from the freshly baked
+	// SHE matrices (GPU is idle here, so the readback is safe).
+	ComputeGroupedSHEFit(Root);
 }
 
 static void RebuildEnvironment(FDemoRoot &Root)
@@ -1665,6 +2261,80 @@ static void RebuildEnvironment(FDemoRoot &Root)
 	eastl::vector<ID3D12Resource *> TexturesThatNeedMipmaps;
 	RecordEnvironmentPrecomputation(Root, TempResources, TexturesThatNeedMipmaps);
 	FinishEnvironmentPrecomputation(Root, TempResources, TexturesThatNeedMipmaps);
+}
+
+static void ReleaseSHEResources(FDemoRoot &Root)
+{
+	SAFE_RELEASE(Root.SHEMatrixA);
+	SAFE_RELEASE(Root.SHEMatrixb);
+	SAFE_RELEASE(Root.SHEMatrixAT);
+	SAFE_RELEASE(Root.SHESHCoeff);
+}
+
+// Re-run only the SHE precomputation (build, reduction, solve, calibrate,
+// diffuse irradiance) with the current bake roughness range and level count.
+// The environment map and split-sum data stay untouched.
+static void RebuildSHEBake(FDemoRoot &Root)
+{
+	WaitForGPU(Root.Gfx);
+	ReleaseSHEResources(Root);
+	Root.NumFrames = 0;
+
+	GetAndInitCommandList(Root.Gfx);
+
+	// The SHE passes share the graphics command list with static geometry
+	// bindings; refresh them the same way the initial environment build does.
+	Root.Gfx.CmdList->IASetVertexBuffers(0, 1, &Root.StaticVBView);
+	Root.Gfx.CmdList->IASetIndexBuffer(&Root.StaticIBView);
+
+	eastl::vector<ID3D12Resource *> TempResources;
+
+	// The SHE passes sample the environment map from compute shaders. Allow both
+	// pixel and non-pixel SRV reads for the rebake and restore the pixel-only state
+	// below so repeated rebakes always start from a known state.
+	Root.Gfx.CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(
+		Root.EnvMap, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)));
+
+	// SHE Build.
+	Root.Gfx.CmdList->SetPipelineState(Root.Pipelines[PSO_SHE_Build]);
+	Root.Gfx.CmdList->SetComputeRootSignature(Root.RootSignatures[PSO_SHE_Build]);
+	SHEBuild(Root, Root.Gfx, Root.SHEMatrixA, Root.SHEMatrixb, Root.SHEMatrixASRV, Root.SHEMatrixbSRV, Root.EnvMapSRV);
+
+	// SHE Reduction.
+	Root.Gfx.CmdList->SetPipelineState(Root.Pipelines[PSO_SHE_Reduction]);
+	Root.Gfx.CmdList->SetComputeRootSignature(Root.RootSignatures[PSO_SHE_Reduction]);
+	SHEReduction(Root, Root.Gfx, Root.SHEMatrixAT, Root.SHEMatrixATSRV, Root.SHEMatrixASRV, Root.SHEMatrixbSRV, TempResources);
+
+	// SHE Solve.
+	Root.Gfx.CmdList->SetPipelineState(Root.Pipelines[PSO_SHE_Solve]);
+	Root.Gfx.CmdList->SetComputeRootSignature(Root.RootSignatures[PSO_SHE_Solve]);
+	SHESolve(Root.Gfx, Root.SHESHCoeff, Root.SHESHCoeffCBV, Root.SHEMatrixATSRV);
+
+	// SHE log-space brightness calibration.
+	Root.Gfx.CmdList->SetPipelineState(Root.Pipelines[PSO_SHE_Calibrate]);
+	Root.Gfx.CmdList->SetComputeRootSignature(Root.RootSignatures[PSO_SHE_Calibrate]);
+	SHECalibrate(Root, Root.Gfx, Root.SHESHCoeff, Root.SHEMatrixASRV, Root.SHEMatrixbSRV);
+
+	// 3-band SH diffuse irradiance from the environment map.
+	SHEDiffuse(Root, Root.Gfx, Root.SHESHCoeff, Root.EnvMapSRV, TempResources);
+
+	Root.Gfx.CmdList->ResourceBarrier(1, get_rvalue_ptr(CD3DX12_RESOURCE_BARRIER::Transition(
+		Root.EnvMap, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)));
+
+	// Close, execute and release temp resources (no mipmap work needed here).
+	Root.Gfx.CmdList->Close();
+	Root.Gfx.CmdQueue->ExecuteCommandLists(1, CommandListCast(&Root.Gfx.CmdList));
+	WaitForGPU(Root.Gfx);
+
+	for (ID3D12Resource *Resource : TempResources)
+	{
+		SAFE_RELEASE(Resource);
+	}
+
+	// Refresh the grouped-fit LUT / table for the new bake parameters.
+	ComputeGroupedSHEFit(Root);
 }
 
 static void LoadGLTFMesh(const char *FileName, FMesh &OutMesh, eastl::vector<FVertex> &InOutVertices, eastl::vector<uint32_t> &InOutIndices)
@@ -1804,6 +2474,7 @@ static void Initialize(FDemoRoot &Root)
 	Root.NumSamples = 1;
 	CreateUIContext(Gfx, Root.NumSamples, Root.UI, TempResources);
 	CreatePipelines(Gfx, Root.NumSamples, Root.Pipelines, Root.RootSignatures, Root.WaveSize);
+	CreateSHECoeffLUTResources(Root);
 
 	eastl::vector<FVertex> AllVertices;
 	eastl::vector<uint32_t> AllIndices;
@@ -1976,6 +2647,11 @@ static void Shutdown(FDemoRoot &Root)
 	SAFE_RELEASE(Root.SHEMatrixb);
 	SAFE_RELEASE(Root.SHEMatrixAT);
 	SAFE_RELEASE(Root.SHESHCoeff);
+	if (Root.SHECoeffLUT)
+	{
+		Root.SHECoeffLUT->Unmap(0, nullptr);
+	}
+	SAFE_RELEASE(Root.SHECoeffLUT);
 	SAFE_RELEASE(Root.MSColorBuffer);
 	SAFE_RELEASE(Root.MSDepthBuffer);
 	SAFE_RELEASE(Root.AccumulationBuffer);

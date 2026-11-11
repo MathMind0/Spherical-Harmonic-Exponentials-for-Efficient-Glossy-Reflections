@@ -48,7 +48,7 @@ void MainCS(
 
     // get roughness
     const float RoughnessRatio = GSHEBuildCB.RoughnessCount > 1 ? (float)RoughnessIndex / (GSHEBuildCB.RoughnessCount - 1) : 0.0f;
-    const float Roughness = lerp(0.4f, 1.0f, RoughnessRatio);
+    const float Roughness = lerp(GSHEBuildCB.RoughnessStart, GSHEBuildCB.RoughnessEnd, RoughnessRatio);
 
     // calculate b
     float NoV = saturate(dot(N, V));

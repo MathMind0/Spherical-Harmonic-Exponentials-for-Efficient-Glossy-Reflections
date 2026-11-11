@@ -5,7 +5,7 @@
 #define GRootSignature                                                                                                       \
 	"RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT), "                                                                        \
 	"CBV(b0), "                                                                                                              \
-	"DescriptorTable(CBV(b1), CBV(b2), SRV(t0), SRV(t1), SRV(t2), SRV(t3), SRV(t4), visibility = SHADER_VISIBILITY_PIXEL), " \
+	"DescriptorTable(CBV(b1), CBV(b2), SRV(t0), SRV(t1), SRV(t2), SRV(t3), SRV(t4), SRV(t5), visibility = SHADER_VISIBILITY_PIXEL), " \
 	"StaticSampler("                                                                                                         \
 	"s0, "                                                                                                                   \
 	"filter = FILTER_MIN_MAG_MIP_LINEAR, "                                                                                   \
@@ -22,6 +22,7 @@ TextureCube GPrefilteredEnvMap : register(t1);
 TextureCube GEnvMap : register(t2);
 Texture2D GBRDFIntegrationMap : register(t3);
 Texture2D GAccumulationBuffer : register(t4);
+StructuredBuffer<float4> GCoeffLUT : register(t5);
 SamplerState GSampler : register(s0);
 
 float3 FresnelSchlick(float CosTheta, float3 F0)
@@ -142,9 +143,29 @@ float3 FresnelSchlickRoughness(float CosTheta, float3 F0, float Roughness)
 		FThreeBandSHVectorRGB Q;
 
 		half3 coeffs[33];
-		for (int i = 0; i < 33; i++)
+		half3 autoBias;
+		if (GPerFrameCB.bUseRoughnessLUT && GPerFrameCB.SHECoeffLUTCount > 0)
 		{
-			coeffs[i] = GSHECoeffCB.Coeffs[i].rgb;
+			const float Denom = max(GPerFrameCB.SHECoeffLUTRoughnessEnd - GPerFrameCB.SHECoeffLUTRoughnessStart, 1e-5f);
+			const float T = saturate((Roughness - GPerFrameCB.SHECoeffLUTRoughnessStart) / Denom) * (float)(GPerFrameCB.SHECoeffLUTCount - 1);
+			const int I0 = (int)floor(T);
+			const int I1 = min(I0 + 1, GPerFrameCB.SHECoeffLUTCount - 1);
+			const float F = T - (float)I0;
+			const int Base0 = I0 * 34;
+			const int Base1 = I1 * 34;
+			[unroll] for (int i = 0; i < 33; ++i)
+			{
+				coeffs[i] = lerp(GCoeffLUT[Base0 + i].rgb, GCoeffLUT[Base1 + i].rgb, F);
+			}
+			autoBias = lerp(GCoeffLUT[Base0 + 33].rgb, GCoeffLUT[Base1 + 33].rgb, F);
+		}
+		else
+		{
+			[unroll] for (int i = 0; i < 33; ++i)
+			{
+				coeffs[i] = GSHECoeffCB.Coeffs[i].rgb;
+			}
+			autoBias = GSHECoeffCB.Coeffs[33].rgb;
 		}
 
 		P.R.V0 = half4(coeffs[0].r, coeffs[1].r, coeffs[2].r, coeffs[3].r);
@@ -170,8 +191,6 @@ float3 FresnelSchlickRoughness(float CosTheta, float3 F0, float Roughness)
 		P.B.V4 = half4(coeffs[16].b, coeffs[17].b, coeffs[18].b, coeffs[19].b);
 		P.B.V5 = half4(coeffs[20].b, coeffs[21].b, coeffs[22].b, coeffs[23].b);
 		P.B.V6 = half(coeffs[24].b);
-
-		half3 autoBias = GSHECoeffCB.Coeffs[33].rgb;
 
 		Q.R.V0 = half4(0.0h, coeffs[25].r, coeffs[26].r, coeffs[27].r);
 		Q.R.V1 = half4(coeffs[28].r, coeffs[29].r, coeffs[30].r, coeffs[31].r);

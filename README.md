@@ -17,7 +17,7 @@ The renderer compares three IBL paths:
 - **SHE**: fits glossy reflection in log-space with spherical harmonic exponentials.
 - **Reference**: stochastic environment sampling used as the comparison target.
 
-The UI supports switching material mode, IBL mode, and HDRI. Changing the HDRI rebuilds the dependent environment data and SHE coefficients.
+The UI supports switching material mode, IBL mode, and HDRI. Changing the HDRI rebuilds the dependent environment data and SHE coefficients. The SHE bake roughness range and level count can also be tuned from the UI; releasing a bake slider re-runs the SHE precomputation only (the HDRI and split-sum data are kept).
 
 ## Build And Run
 

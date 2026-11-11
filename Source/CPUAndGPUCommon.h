@@ -43,6 +43,10 @@ struct SALIGN FPerFrameConstantData
 	int IBLMode;
 	uint32_t NumFrames;
 	int bOrthographic; // 1 = orthographic (parallel view rays, use ViewDirection), 0 = perspective (rays converge at ViewerPosition).
+	int bUseRoughnessLUT;            // 1 = render SHE with per-roughness grouped-fit coefficients (LUT).
+	int SHECoeffLUTCount;            // Number of roughness groups stored in the LUT buffer.
+	float SHECoeffLUTRoughnessStart; // Roughness value represented by LUT group 0.
+	float SHECoeffLUTRoughnessEnd;   // Roughness value represented by the last LUT group.
 };
 
 struct SALIGN FSHEBuildConstantData
@@ -53,6 +57,8 @@ struct SALIGN FSHEBuildConstantData
 	int32_t NormalCountSqrt;
 	int32_t RoughnessCount;
 	int32_t SphericalHarmonicCount;
+	float RoughnessStart; // Bake roughness range start.
+	float RoughnessEnd;   // Bake roughness range end.
 };
 
 struct SALIGN FSHEReductionConstantData
