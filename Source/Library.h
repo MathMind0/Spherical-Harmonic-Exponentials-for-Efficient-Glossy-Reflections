@@ -89,6 +89,8 @@ void LoadPLYFile(const char* FileName, eastl::vector<XMFLOAT3>& InOutPositions, 
 
 void CreateGraphicsContext(HWND Window, bool bShouldCreateDepthBuffer, FGraphicsContext& Gfx);
 void DestroyGraphicsContext(FGraphicsContext& Gfx);
+void ResizeSwapChain(FGraphicsContext& Gfx, uint32_t Width, uint32_t Height);
+bool PollWindowResize(uint32_t& OutWidth, uint32_t& OutHeight);
 FDescriptorHeap& GetDescriptorHeap(FGraphicsContext& Gfx, D3D12_DESCRIPTOR_HEAP_TYPE Type, D3D12_DESCRIPTOR_HEAP_FLAGS Flags, uint32_t& OutDescriptorSize);
 void PresentFrame(FGraphicsContext& Gfx, uint32_t SwapInterval);
 void WaitForGPU(FGraphicsContext& Gfx);

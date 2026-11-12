@@ -520,7 +520,7 @@ static void Draw(FDemoRoot &Root)
 	XMMATRIX ProjectionTransform;
 	if (Root.bOrthographicProjection)
 	{
-		const float AspectRatio = 1.777f;
+		const float AspectRatio = (float)Gfx.Resolution[0] / (float)Gfx.Resolution[1];
 		const float GridWidth = 10 * 2.2f;
 		const float GridHeight = 6 * 2.2f;
 		float ViewWidth = GridWidth + 4.0f;
@@ -538,7 +538,7 @@ static void Draw(FDemoRoot &Root)
 	{
 		// Perspective FOV derived so that at the current orbit distance the grid
 		// (with the same margin) fills the viewport similarly to the ortho view.
-		const float AspectRatio = 1.777f;
+		const float AspectRatio = (float)Gfx.Resolution[0] / (float)Gfx.Resolution[1];
 		const float GridWidth = 10 * 2.2f;
 		const float GridHeight = 6 * 2.2f;
 		float ViewWidth = GridWidth + 4.0f;
@@ -2464,6 +2464,59 @@ static void LoadGLTFMesh(const char *FileName, FMesh &OutMesh, eastl::vector<FVe
 	cgltf_free(Data);
 }
 
+static void OnWindowResize(FDemoRoot &Root, uint32_t Width, uint32_t Height)
+{
+	FGraphicsContext &Gfx = Root.Gfx;
+
+	// Ignore no-op resizes (e.g. the initial WM_SIZE sent at window creation).
+	if (Gfx.Resolution[0] == Width && Gfx.Resolution[1] == Height)
+	{
+		return;
+	}
+
+	// Rebuild the swap chain and its render-target views for the new size.
+	ResizeSwapChain(Gfx, Width, Height);
+
+	// Recreate all size-dependent render resources (MSAA color, MSAA depth,
+	// accumulation). Their descriptor handles are stable, so only the resources
+	// and views need to be refreshed in place.
+	SAFE_RELEASE(Root.MSColorBuffer);
+	SAFE_RELEASE(Root.MSDepthBuffer);
+	SAFE_RELEASE(Root.AccumulationBuffer);
+
+	{
+		CD3DX12_RESOURCE_DESC DescColor = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R8G8B8A8_UNORM, Gfx.Resolution[0], Gfx.Resolution[1], 1, 1, Root.NumSamples);
+		DescColor.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+		VHR(Gfx.Device->CreateCommittedResource(get_rvalue_ptr(CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT)), D3D12_HEAP_FLAG_NONE, &DescColor, D3D12_RESOURCE_STATE_RENDER_TARGET, get_rvalue_ptr(CD3DX12_CLEAR_VALUE(DXGI_FORMAT_R8G8B8A8_UNORM, XMVECTORF32{0.0f})), IID_PPV_ARGS(&Root.MSColorBuffer)));
+
+		CD3DX12_RESOURCE_DESC DescDepth = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_D32_FLOAT, Gfx.Resolution[0], Gfx.Resolution[1], 1, 1, Root.NumSamples);
+		DescDepth.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+		VHR(Gfx.Device->CreateCommittedResource(get_rvalue_ptr(CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT)), D3D12_HEAP_FLAG_NONE, &DescDepth, D3D12_RESOURCE_STATE_DEPTH_WRITE, get_rvalue_ptr(CD3DX12_CLEAR_VALUE(DXGI_FORMAT_D32_FLOAT, 1.0f, 0)), IID_PPV_ARGS(&Root.MSDepthBuffer)));
+
+		Gfx.Device->CreateRenderTargetView(Root.MSColorBuffer, nullptr, Root.MSColorBufferRTV);
+		Gfx.Device->CreateDepthStencilView(Root.MSDepthBuffer, nullptr, Root.MSDepthBufferDSV);
+	}
+
+	{
+		CD3DX12_RESOURCE_DESC DescAccum = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R8G8B8A8_UNORM, Gfx.Resolution[0], Gfx.Resolution[1],
+																	   1, 1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+		VHR(Gfx.Device->CreateCommittedResource(get_rvalue_ptr(CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT)), D3D12_HEAP_FLAG_NONE,
+												&DescAccum, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&Root.AccumulationBuffer)));
+
+		D3D12_SHADER_RESOURCE_VIEW_DESC SRVDesc = {};
+		SRVDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		SRVDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		SRVDesc.Texture2D.MipLevels = 1;
+		SRVDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		Gfx.Device->CreateShaderResourceView(Root.AccumulationBuffer, &SRVDesc, Root.AccumulationBufferSRV);
+	}
+
+	// Keep ImGui's coordinate space and the progressive accumulation in sync.
+	ImGuiIO &IO = ImGui::GetIO();
+	IO.DisplaySize = ImVec2((float)Gfx.Resolution[0], (float)Gfx.Resolution[1]);
+	Root.NumFrames = 0;
+}
+
 static void Initialize(FDemoRoot &Root)
 {
 	FGraphicsContext &Gfx = Root.Gfx;
@@ -2670,6 +2723,15 @@ static int32_t Run(FDemoRoot &Root)
 
 	for (;;)
 	{
+		// Handle a pending window resize before drawing the next frame so the
+		// swap chain and all size-dependent resources match the new client area.
+		uint32_t ResizeWidth = 0;
+		uint32_t ResizeHeight = 0;
+		if (PollWindowResize(ResizeWidth, ResizeHeight))
+		{
+			OnWindowResize(Root, ResizeWidth, ResizeHeight);
+		}
+
 		MSG Message = {};
 		if (PeekMessage(&Message, 0, 0, 0, PM_REMOVE))
 		{

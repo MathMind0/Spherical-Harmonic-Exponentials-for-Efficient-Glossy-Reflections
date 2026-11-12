@@ -12,6 +12,10 @@
 
 static void CreateHeaps(FGraphicsContext& Gfx);
 
+// Set by ProcessWindowMessage on WM_SIZE, consumed by the main loop via PollWindowResize().
+static volatile LONG GPendingResizeWidth = 0;
+static volatile LONG GPendingResizeHeight = 0;
+
 void* operator new[](size_t Size, const char* /*Name*/, int /*Flags*/, unsigned /*DebugFlags*/, const char* /*File*/, int /*Line*/)
 {
 	return malloc(Size);
@@ -736,6 +740,18 @@ static LRESULT CALLBACK ProcessWindowMessage(HWND Window, UINT Message, WPARAM W
 		IO.MousePos.x = (signed short)LParam;
 		IO.MousePos.y = (signed short)(LParam >> 16);
 		return 0;
+	case WM_SIZE:
+	{
+		// Ignore the minimized state and any transient zero-sized client area.
+		const uint32_t ClientWidth = (uint32_t)LOWORD(LParam);
+		const uint32_t ClientHeight = (uint32_t)HIWORD(LParam);
+		if (WParam != SIZE_MINIMIZED && ClientWidth > 0 && ClientHeight > 0)
+		{
+			InterlockedExchange(&GPendingResizeWidth, (LONG)ClientWidth);
+			InterlockedExchange(&GPendingResizeHeight, (LONG)ClientHeight);
+		}
+		return 0;
+	}
 	case WM_DESTROY:
 		PostQuitMessage(0);
 		return 0;
@@ -784,15 +800,57 @@ HWND CreateSimpleWindow(const char* Name, uint32_t Width, uint32_t Height)
 		EA_ASSERT(0);
 	}
 
+	const DWORD Style = WS_OVERLAPPEDWINDOW;
 	RECT Rect = { 0, 0, (LONG)Width, (LONG)Height };
-	if (!AdjustWindowRect(&Rect, WS_OVERLAPPED | WS_SYSMENU | WS_CAPTION | WS_MINIMIZEBOX, 0))
+	if (!AdjustWindowRect(&Rect, Style, 0))
 	{
 		EA_ASSERT(0);
 	}
 
-	HWND Window = CreateWindowEx(0, Name, Name, WS_OVERLAPPED | WS_SYSMENU | WS_CAPTION | WS_MINIMIZEBOX | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, Rect.right - Rect.left, Rect.bottom - Rect.top, nullptr, nullptr, nullptr, 0);
+	HWND Window = CreateWindowEx(0, Name, Name, Style | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, Rect.right - Rect.left, Rect.bottom - Rect.top, nullptr, nullptr, nullptr, 0);
 	EA_ASSERT(Window);
 	return Window;
+}
+
+void ResizeSwapChain(FGraphicsContext& Gfx, uint32_t Width, uint32_t Height)
+{
+	// All references to the swap-chain buffers must be released before ResizeBuffers,
+	// and the GPU must be idle so no in-flight frame still uses them.
+	WaitForGPU(Gfx);
+
+	for (uint32_t Idx = 0; Idx < 4; ++Idx)
+	{
+		SAFE_RELEASE(Gfx.SwapBuffers[Idx]);
+	}
+
+	VHR(Gfx.SwapChain->ResizeBuffers(4, Width, Height, DXGI_FORMAT_R8G8B8A8_UNORM, 0));
+
+	Gfx.Resolution[0] = Width;
+	Gfx.Resolution[1] = Height;
+
+	D3D12_CPU_DESCRIPTOR_HANDLE Handle = Gfx.RTVHeap.CPUStart;
+	for (uint32_t Idx = 0; Idx < 4; ++Idx)
+	{
+		VHR(Gfx.SwapChain->GetBuffer(Idx, IID_PPV_ARGS(&Gfx.SwapBuffers[Idx])));
+		Gfx.Device->CreateRenderTargetView(Gfx.SwapBuffers[Idx], nullptr, Handle);
+		Handle.ptr += Gfx.DescriptorSizeRTV;
+	}
+
+	// ResizeBuffers resets the back-buffer index; keep our cached index in sync.
+	Gfx.BackBufferIndex = Gfx.SwapChain->GetCurrentBackBufferIndex();
+}
+
+bool PollWindowResize(uint32_t& OutWidth, uint32_t& OutHeight)
+{
+	const LONG Width = InterlockedExchange(&GPendingResizeWidth, 0);
+	const LONG Height = InterlockedExchange(&GPendingResizeHeight, 0);
+	if (Width > 0 && Height > 0)
+	{
+		OutWidth = (uint32_t)Width;
+		OutHeight = (uint32_t)Height;
+		return true;
+	}
+	return false;
 }
 
 void LoadPLYFile(const char* FileName, eastl::vector<XMFLOAT3>& InOutPositions, eastl::vector<XMFLOAT3>& InOutNormals, eastl::vector<XMFLOAT2>& InOutTexcoords, eastl::vector<uint32_t>& InOutTriangles)
