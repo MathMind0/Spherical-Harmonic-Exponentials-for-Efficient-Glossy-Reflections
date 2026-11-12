@@ -23,6 +23,8 @@ static const uint32_t GSHENormalCount = GSHENormalCountSqrt * GSHENormalCountSqr
 static const uint32_t GSHESphericalHarmonicCount = 33;
 static const uint32_t GSHECoeffLUTMaxGroups = 16; // Matches the UI max bake levels.
 static const uint32_t GSHECoeffPerGroup = 34;     // 33 specular + 1 autoBias float4.
+static const uint32_t GSHECoeffLUTMaxBasis = 16;   // Max PCA basis vectors (N).
+static const uint32_t GSHECoeffLUTMaxFloat4 = 1024; // LUT buffer capacity (mean+basis+weights).
 
 // The 33 specular coefficients grouped by SH band (order l).
 // P (5-band, indices 0..24): l0=1, l1=3, l2=5, l3=7, l4=9.
@@ -299,6 +301,11 @@ struct FDemoRoot
 	int BakeRoughnessCount = 4; // SHE bake roughness levels.
 	int PendingSHEBake = 0; // 1 = re-run the SHE precomputation with the current bake parameters.
 	bool bUseRoughnessLUT = false;  // ImGui toggle: render SHE with per-roughness grouped-fit coefficients.
+	bool bUsePCA = false;           // ImGui toggle: PCA-compress the Roughness LUT and reconstruct at runtime.
+	int PCABasisCount = 4;          // Requested number of PCA basis vectors (N).
+	int ActivePCABasisCount = 0;    // N actually used by the current LUT layout (clamped).
+	int PCALUTDirty = 0;            // 1 = rebuild the LUT buffer from CoeffTable (no rebake needed).
+	float PCAExplainedVariance = 0.0f; // Fraction of total variance kept by the top-N basis vectors.
 	bool bRandomRoughness = false;  // ImGui toggle: jitter each bake row roughness within its group band.
 	bool bShowCoeffTable = true;    // ImGui toggle: show the grouped-fit coefficient / variance table.
 	FSHECoeffTable CoeffTable;      // CPU copy of the grouped-fit coefficients and their variance.
@@ -310,6 +317,7 @@ struct FDemoRoot
 static void RebuildEnvironment(FDemoRoot &Root);
 static void RebuildSHEBake(FDemoRoot &Root);
 static void ComputeGroupedSHEFit(FDemoRoot &Root);
+static void UploadCoeffLUT(FDemoRoot &Root);
 static void DrawSHECoeffTable(FDemoRoot &Root);
 
 static void UpdateUI(FDemoRoot &Root, float DeltaTime)
@@ -410,6 +418,16 @@ static void UpdateUI(FDemoRoot &Root, float DeltaTime)
 		ImGui::Text("Roughness LUT");
 		ImGui::Checkbox("Use per-group SHE fit (LUT)", &Root.bUseRoughnessLUT);
 		ImGui::TextDisabled("Grouped-fit coefficients drive the SHE render");
+		if (ImGui::Checkbox("PCA Compress LUT", &Root.bUsePCA))
+		{
+			Root.PCALUTDirty = 1;
+		}
+		ImGui::TextDisabled("Reconstruct coefficients from top-N PCA basis vectors");
+		if (ImGui::SliderInt("##PCABasisCount", &Root.PCABasisCount, 1, 16, "PCA Basis %d"))
+		{
+			Root.PCALUTDirty = 1;
+		}
+		ImGui::TextDisabled("Basis vectors kept (ranked by variance / importance)");
 		ImGui::Checkbox("Show coefficient table", &Root.bShowCoeffTable);
 		ImGui::TextDisabled("Coefficients by band + variance vs ungrouped");
 	}
@@ -445,6 +463,16 @@ static void Update(FDemoRoot &Root)
 	float DeltaTime;
 	UpdateFrameStats(Root.Gfx.Window, "ImageBasedPBR", Time, DeltaTime, Root.NumFrames);
 	UpdateUI(Root, DeltaTime);
+
+	// Re-pack the LUT buffer when the PCA toggle / basis count changed. This
+	// only rewrites the persistently-mapped buffer from the CPU coefficient
+	// table; no rebake is needed. Rebuild paths already re-upload via
+	// ComputeGroupedSHEFit, so clear the flag afterwards either way.
+	if (Root.PCALUTDirty && Root.CoeffTable.Valid)
+	{
+		UploadCoeffLUT(Root);
+	}
+	Root.PCALUTDirty = 0;
 
 	if (Root.PendingEnvironmentMapIndex >= 0)
 	{
@@ -704,6 +732,8 @@ static void Draw(FDemoRoot &Root)
 			CPUAddress->SHECoeffLUTCount = Root.CoeffTable.Valid ? Root.CoeffTable.BakeRoughnessCount : 0;
 			CPUAddress->SHECoeffLUTRoughnessStart = Root.CoeffTable.RoughnessStart;
 			CPUAddress->SHECoeffLUTRoughnessEnd = Root.CoeffTable.RoughnessEnd;
+			CPUAddress->bUsePCA = (Root.bUsePCA && Root.CoeffTable.Valid) ? 1 : 0;
+			CPUAddress->SHEPCABasisCount = (Root.bUsePCA && Root.CoeffTable.Valid) ? Root.ActivePCABasisCount : 0;
 
 			CD3DX12_CPU_DESCRIPTOR_HANDLE TableBaseCPU;
 			CD3DX12_GPU_DESCRIPTOR_HANDLE TableBaseGPU;
@@ -1781,7 +1811,9 @@ static void SHEDiffuse(FDemoRoot &Root, FGraphicsContext &Gfx, ID3D12Resource *S
 static void CreateSHECoeffLUTResources(FDemoRoot &Root)
 {
 	FGraphicsContext &Gfx = Root.Gfx;
-	const uint32_t NumFloat4 = GSHECoeffLUTMaxGroups * GSHECoeffPerGroup; // 16 * 34 = 544
+	// Enough for the raw layout (G*34) or the PCA layout (34 + N*34 + G*N);
+	// both stay well under this capacity (max 34 + 16*34 + 16*16 = 834).
+	const uint32_t NumFloat4 = GSHECoeffLUTMaxFloat4;
 	const UINT64 BufferSize = (UINT64)NumFloat4 * sizeof(float4);
 	const D3D12_RESOURCE_DESC Desc = CD3DX12_RESOURCE_DESC::Buffer(BufferSize);
 	VHR(Gfx.Device->CreateCommittedResource(
@@ -1799,6 +1831,186 @@ static void CreateSHECoeffLUTResources(FDemoRoot &Root)
 	S.Buffer.NumElements = NumFloat4;
 	S.Buffer.StructureByteStride = sizeof(float4);
 	Gfx.Device->CreateShaderResourceView(Root.SHECoeffLUT, &S, Root.SHECoeffLUTSRV);
+}
+
+// Jacobi eigen-decomposition of a symmetric n x n matrix (Numerical Recipes).
+// a[][] is overwritten; eigenvalues returned in d[], eigenvector j is the
+// j-th column of v[][] (v[i][j] = component i of eigenvector j).
+static void JacobiEigen(double a[16][16], int n, double d[16], double v[16][16])
+{
+	double b[16], z[16];
+	for (int ip = 0; ip < n; ++ip)
+	{
+		for (int iq = 0; iq < n; ++iq) v[ip][iq] = 0.0;
+		v[ip][ip] = 1.0;
+	}
+	for (int ip = 0; ip < n; ++ip) { b[ip] = d[ip] = a[ip][ip]; z[ip] = 0.0; }
+	for (int iter = 1; iter <= 50; ++iter)
+	{
+		double sm = 0.0;
+		for (int ip = 0; ip < n - 1; ++ip)
+			for (int iq = ip + 1; iq < n; ++iq) sm += fabs(a[ip][iq]);
+		if (sm < 1e-14) break;
+		const double tresh = iter < 4 ? 0.2 * sm / (n * n) : 0.0;
+		for (int ip = 0; ip < n - 1; ++ip)
+		{
+			for (int iq = ip + 1; iq < n; ++iq)
+			{
+				const double g = 100.0 * fabs(a[ip][iq]);
+				if (iter > 4 && fabs(d[ip]) + g == fabs(d[ip]) && fabs(d[iq]) + g == fabs(d[iq]))
+				{
+					a[ip][iq] = 0.0;
+				}
+				else if (fabs(a[ip][iq]) > tresh)
+				{
+					const double h = d[iq] - d[ip];
+					double t;
+					if (fabs(h) + g == fabs(h))
+					{
+						t = a[ip][iq] / h;
+					}
+					else
+					{
+						const double theta = 0.5 * h / a[ip][iq];
+						t = 1.0 / (fabs(theta) + sqrt(1.0 + theta * theta));
+						if (theta < 0.0) t = -t;
+					}
+					const double c = 1.0 / sqrt(1.0 + t * t);
+					const double s = t * c;
+					const double tau = s / (1.0 + c);
+					const double hh = t * a[ip][iq];
+					z[ip] -= hh; z[iq] += hh;
+					d[ip] -= hh; d[iq] += hh;
+					a[ip][iq] = 0.0;
+					for (int j = 0; j < ip; ++j)
+					{
+						const double g0 = a[j][ip], h0 = a[j][iq];
+						a[j][ip] = g0 - s * (h0 + g0 * tau);
+						a[j][iq] = h0 + s * (g0 - h0 * tau);
+					}
+					for (int j = ip + 1; j < iq; ++j)
+					{
+						const double g0 = a[ip][j], h0 = a[j][iq];
+						a[ip][j] = g0 - s * (h0 + g0 * tau);
+						a[j][iq] = h0 + s * (g0 - h0 * tau);
+					}
+					for (int j = iq + 1; j < n; ++j)
+					{
+						const double g0 = a[ip][j], h0 = a[iq][j];
+						a[ip][j] = g0 - s * (h0 + g0 * tau);
+						a[iq][j] = h0 + s * (g0 - h0 * tau);
+					}
+					for (int j = 0; j < n; ++j)
+					{
+						const double g0 = v[j][ip], h0 = v[j][iq];
+						v[j][ip] = g0 - s * (h0 + g0 * tau);
+						v[j][iq] = h0 + s * (g0 - h0 * tau);
+					}
+				}
+			}
+		}
+		for (int ip = 0; ip < n; ++ip) { b[ip] += z[ip]; d[ip] = b[ip]; z[ip] = 0.0; }
+	}
+}
+
+// Pack the persistently-mapped LUT buffer from the CPU coefficient table.
+//  - raw : [g*34 + i].rgb = group g, parameter i (33 coeffs + autoBias).
+//  - PCA : [0..33] mean, [34 + k*34 + i] basis k, [34+N*34 + g*N + k].x weight.
+// PCA uses the snapshot method: eigen-decompose the G x G group Gram matrix
+// (G <= 16 << 102 dimensions), keep the top-N eigenvectors by eigenvalue
+// (= captured variance / importance), build 102-d basis vectors and each
+// group weight vector. The shader reconstructs mean + sum_k w[k]*basis[k].
+static void UploadCoeffLUT(FDemoRoot &Root)
+{
+	FSHECoeffTable &T = Root.CoeffTable;
+	if (!T.Valid || !Root.SHECoeffLUTMapped) return;
+	float4 *LUT = (float4 *)Root.SHECoeffLUTMapped;
+	const int G = T.BakeRoughnessCount;
+	memset(LUT, 0, sizeof(float4) * GSHECoeffLUTMaxFloat4);
+
+	if (!Root.bUsePCA)
+	{
+		for (int g = 0; g < G; ++g)
+			for (int i = 0; i < 34; ++i)
+				LUT[g * 34 + i] = XMFLOAT4(T.Coeff[g][i][0], T.Coeff[g][i][1], T.Coeff[g][i][2], 0.0f);
+		Root.ActivePCABasisCount = 0;
+		Root.PCAExplainedVariance = 1.0f;
+		return;
+	}
+
+	const int D = 34 * 3; // 102 dims per group.
+	float x[GSHECoeffLUTMaxGroups][102];
+	float mean[102] = {};
+	for (int g = 0; g < G; ++g)
+		for (int i = 0; i < 34; ++i)
+			for (int c = 0; c < 3; ++c)
+			{
+				const int d = i * 3 + c;
+				x[g][d] = T.Coeff[g][i][c];
+				mean[d] += x[g][d];
+			}
+	for (int d = 0; d < D; ++d) mean[d] /= (float)G;
+	float y[GSHECoeffLUTMaxGroups][102];
+	for (int g = 0; g < G; ++g)
+		for (int d = 0; d < D; ++d)
+			y[g][d] = x[g][d] - mean[d];
+
+	double K[16][16] = {};
+	for (int g = 0; g < G; ++g)
+		for (int h = 0; h < G; ++h)
+		{
+			double s = 0.0;
+			for (int d = 0; d < D; ++d) s += (double)y[g][d] * y[h][d];
+			K[g][h] = s;
+		}
+	double eigVal[16] = {}, eigVec[16][16] = {};
+	JacobiEigen(K, G, eigVal, eigVec);
+
+	double lam[16];
+	int cols[16];
+	for (int k = 0; k < G; ++k) { lam[k] = eigVal[k] > 0.0 ? eigVal[k] : 0.0; cols[k] = k; }
+	for (int a = 1; a < G; ++a) // insertion sort, descending by eigenvalue
+	{
+		const double kl = lam[a]; const int kc = cols[a];
+		int b = a - 1;
+		while (b >= 0 && lam[b] < kl) { lam[b + 1] = lam[b]; cols[b + 1] = cols[b]; --b; }
+		lam[b + 1] = kl; cols[b + 1] = kc;
+	}
+
+	int N = Root.PCABasisCount;
+	if (N < 1) N = 1;
+	if (N > G) N = G;
+	if (N > (int)GSHECoeffLUTMaxBasis) N = GSHECoeffLUTMaxBasis;
+	Root.ActivePCABasisCount = N;
+
+	double totalVar = 0.0, keptVar = 0.0;
+	for (int k = 0; k < G; ++k) totalVar += lam[k];
+	for (int k = 0; k < N; ++k) keptVar += lam[k];
+	Root.PCAExplainedVariance = totalVar > 1e-12 ? (float)(keptVar / totalVar) : 1.0f;
+
+	for (int i = 0; i < 34; ++i) // mean
+		LUT[i] = XMFLOAT4(mean[i * 3 + 0], mean[i * 3 + 1], mean[i * 3 + 2], 0.0f);
+
+	const int WeightBase = 34 + N * 34;
+	for (int k = 0; k < N; ++k)
+	{
+		const int col = cols[k];
+		const double invSqrt = lam[k] > 1e-12 ? 1.0 / sqrt(lam[k]) : 0.0;
+		float basis[102] = {};
+		for (int g = 0; g < G; ++g)
+		{
+			const double coef = eigVec[g][col] * invSqrt;
+			for (int d = 0; d < D; ++d) basis[d] += (float)(coef * y[g][d]);
+		}
+		for (int i = 0; i < 34; ++i)
+			LUT[34 + k * 34 + i] = XMFLOAT4(basis[i * 3 + 0], basis[i * 3 + 1], basis[i * 3 + 2], 0.0f);
+		for (int g = 0; g < G; ++g)
+		{
+			float w = 0.0f;
+			for (int d = 0; d < D; ++d) w += y[g][d] * basis[d];
+			LUT[WeightBase + g * N + k] = XMFLOAT4(w, 0.0f, 0.0f, 0.0f);
+		}
+	}
 }
 
 // Read back the baked SHE matrices and solve a separate 33-coefficient fit for
@@ -2019,19 +2231,12 @@ static void ComputeGroupedSHEFit(FDemoRoot &Root)
 		Table.TotalVariance[g] = TotalN > 0 ? TotalSum / TotalN : 0.0f;
 	}
 
-	// Upload grouped coefficients into the persistently mapped LUT buffer.
-	if (Root.SHECoeffLUTMapped)
-	{
-		float4 *LUT = (float4 *)Root.SHECoeffLUTMapped;
-		for (uint32_t g = 0; g < RoughnessCount; ++g)
-		{
-			for (int i = 0; i < 34; ++i)
-			{
-				LUT[g * 34 + i] = XMFLOAT4(Table.Coeff[g][i][0], Table.Coeff[g][i][1], Table.Coeff[g][i][2], 0.0f);
-			}
-		}
-	}
 	Table.Valid = 1;
+
+	// Pack the LUT buffer (raw coefficients or PCA mean/basis/weights,
+	// depending on the current panel state).
+	UploadCoeffLUT(Root);
+
 	Root.NumFrames = 0;
 }
 
@@ -2056,6 +2261,11 @@ static void DrawSHECoeffTable(FDemoRoot &Root)
 	}
 	const int N = T.BakeRoughnessCount;
 	ImGui::Text("Groups: %d   Bake range: [%.2f, %.2f]", N, T.RoughnessStart, T.RoughnessEnd);
+	if (Root.bUsePCA)
+	{
+		ImGui::Text("PCA: %d / %d basis vectors, explained variance %.1f%%",
+			Root.ActivePCABasisCount, Root.PCABasisCount, Root.PCAExplainedVariance * 100.0f);
+	}
 	ImGui::TextDisabled("Cells show the 33 coefficients (luma) grouped by SH band; v= per-band MSE vs ungrouped; last column = total MSE.");
 
 	const int NumCols = 1 + GCoeffBandCount + 1;

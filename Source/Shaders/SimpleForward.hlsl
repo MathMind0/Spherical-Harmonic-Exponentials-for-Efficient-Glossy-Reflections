@@ -151,13 +151,43 @@ float3 FresnelSchlickRoughness(float CosTheta, float3 F0, float Roughness)
 			const int I0 = (int)floor(T);
 			const int I1 = min(I0 + 1, GPerFrameCB.SHECoeffLUTCount - 1);
 			const float F = T - (float)I0;
-			const int Base0 = I0 * 34;
-			const int Base1 = I1 * 34;
-			[unroll] for (int i = 0; i < 33; ++i)
+			if (GPerFrameCB.bUsePCA && GPerFrameCB.SHEPCABasisCount > 0)
 			{
-				coeffs[i] = lerp(GCoeffLUT[Base0 + i].rgb, GCoeffLUT[Base1 + i].rgb, F);
+				// PCA-compressed LUT (flat float4 stream):
+				//   [0 .. 33]                 : per-parameter mean (rgb)
+				//   [34 + k*34 + i]           : basis vector k, parameter i (rgb)
+				//   [34 + NB*34 + g*NB + k]  : weight of group g on basis k (.x)
+				// Interpolate the low-dimensional weights across roughness, then
+				// reconstruct all 34 params = mean + sum_k w[k]*basis[k].
+				const int NB = GPerFrameCB.SHEPCABasisCount;
+				const int WeightBase = 34 + NB * 34;
+				float W[16];
+				[loop] for (int k = 0; k < NB; ++k)
+				{
+					W[k] = lerp(GCoeffLUT[WeightBase + I0 * NB + k].x,
+								GCoeffLUT[WeightBase + I1 * NB + k].x, F);
+				}
+				[unroll] for (int i = 0; i < 34; ++i)
+				{
+					float3 val = GCoeffLUT[i].rgb; // mean
+					[loop] for (int k = 0; k < NB; ++k)
+					{
+						val += W[k] * GCoeffLUT[34 + k * 34 + i].rgb;
+					}
+					if (i < 33) coeffs[i] = (half3)val;
+					else        autoBias = (half3)val;
+				}
 			}
-			autoBias = lerp(GCoeffLUT[Base0 + 33].rgb, GCoeffLUT[Base1 + 33].rgb, F);
+			else
+			{
+				const int Base0 = I0 * 34;
+				const int Base1 = I1 * 34;
+				[unroll] for (int i = 0; i < 33; ++i)
+				{
+					coeffs[i] = lerp(GCoeffLUT[Base0 + i].rgb, GCoeffLUT[Base1 + i].rgb, F);
+				}
+				autoBias = lerp(GCoeffLUT[Base0 + 33].rgb, GCoeffLUT[Base1 + 33].rgb, F);
+			}
 		}
 		else
 		{

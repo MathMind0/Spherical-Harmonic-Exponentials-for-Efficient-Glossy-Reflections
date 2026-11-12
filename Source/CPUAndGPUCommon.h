@@ -47,6 +47,8 @@ struct SALIGN FPerFrameConstantData
 	int SHECoeffLUTCount;            // Number of roughness groups stored in the LUT buffer.
 	float SHECoeffLUTRoughnessStart; // Roughness value represented by LUT group 0.
 	float SHECoeffLUTRoughnessEnd;   // Roughness value represented by the last LUT group.
+	int bUsePCA;                     // 1 = reconstruct LUT coefficients from PCA basis + weights.
+	int SHEPCABasisCount;            // Number of PCA basis vectors actually active (N).
 };
 
 struct SALIGN FSHEBuildConstantData
