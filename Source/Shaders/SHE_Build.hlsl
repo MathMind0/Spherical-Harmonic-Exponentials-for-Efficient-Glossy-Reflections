@@ -47,8 +47,28 @@ void MainCS(
     const float3 V = UniformSampleHemisphere(ViewIndex2D, N);
 
     // get roughness
-    const float RoughnessRatio = GSHEBuildCB.RoughnessCount > 1 ? (float)RoughnessIndex / (GSHEBuildCB.RoughnessCount - 1) : 0.0f;
-    const float Roughness = lerp(GSHEBuildCB.RoughnessStart, GSHEBuildCB.RoughnessEnd, RoughnessRatio);
+    float Roughness;
+    if (GSHEBuildCB.bRandomRoughness)
+    {
+        // "Random Roughness": instead of pinning every row of a group to one
+        // fixed r_g, give each (view, normal, group) row its own deterministic
+        // pseudo-random roughness drawn from that group stratified sub-band.
+        // Stratifying by RoughnessIndex keeps the group anchored to a roughness
+        // band (so the LUT interpolation stays meaningful), while the union of
+        // all rows covers the whole [Start, End] range continuously. The same
+        // Roughness feeds both the vMF features (A) and GGX integration (b)
+        // below, so every row stays self-consistent.
+        const uint2 Seed = uint2((uint)ViewIndex * 64u + (uint)NormalIndex, (uint)RoughnessIndex);
+        const uint Hash = HashPixelAndSample(Seed, 0x9e3779b9u);
+        const float u = (float)Hash * 2.3283064365386963e-10f; // [0, 1)
+        const float Ratio = ((float)RoughnessIndex + u) / (float)GSHEBuildCB.RoughnessCount;
+        Roughness = lerp(GSHEBuildCB.RoughnessStart, GSHEBuildCB.RoughnessEnd, Ratio);
+    }
+    else
+    {
+        const float RoughnessRatio = GSHEBuildCB.RoughnessCount > 1 ? (float)RoughnessIndex / (GSHEBuildCB.RoughnessCount - 1) : 0.0f;
+        Roughness = lerp(GSHEBuildCB.RoughnessStart, GSHEBuildCB.RoughnessEnd, RoughnessRatio);
+    }
 
     // calculate b
     float NoV = saturate(dot(N, V));

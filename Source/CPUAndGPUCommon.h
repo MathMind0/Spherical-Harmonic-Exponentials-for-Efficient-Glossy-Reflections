@@ -59,6 +59,7 @@ struct SALIGN FSHEBuildConstantData
 	int32_t SphericalHarmonicCount;
 	float RoughnessStart; // Bake roughness range start.
 	float RoughnessEnd;   // Bake roughness range end.
+	int32_t bRandomRoughness; // 1 = jitter each bake row roughness within its group band.
 };
 
 struct SALIGN FSHEReductionConstantData

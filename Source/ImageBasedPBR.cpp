@@ -299,6 +299,7 @@ struct FDemoRoot
 	int BakeRoughnessCount = 4; // SHE bake roughness levels.
 	int PendingSHEBake = 0; // 1 = re-run the SHE precomputation with the current bake parameters.
 	bool bUseRoughnessLUT = false;  // ImGui toggle: render SHE with per-roughness grouped-fit coefficients.
+	bool bRandomRoughness = false;  // ImGui toggle: jitter each bake row roughness within its group band.
 	bool bShowCoeffTable = true;    // ImGui toggle: show the grouped-fit coefficient / variance table.
 	FSHECoeffTable CoeffTable;      // CPU copy of the grouped-fit coefficients and their variance.
 	uint32_t NumSamples;
@@ -390,6 +391,12 @@ static void UpdateUI(FDemoRoot &Root, float DeltaTime)
 		{
 			bBakeDirty = true;
 		}
+
+		if (ImGui::Checkbox("Random Roughness", &Root.bRandomRoughness))
+		{
+			bBakeDirty = true;
+		}
+		ImGui::TextDisabled("Jitter each bake row roughness inside its group band");
 
 		ImGui::TextDisabled("SHE rebake runs on slider release");
 
@@ -1394,6 +1401,7 @@ static void SHEBuild(const FDemoRoot &Root, FGraphicsContext &Gfx, ID3D12Resourc
 	CPUAddress->SphericalHarmonicCount = SphericalHarmonicCount;
 	CPUAddress->RoughnessStart = Root.BakeRoughnessStart;
 	CPUAddress->RoughnessEnd = Root.BakeRoughnessEnd;
+	CPUAddress->bRandomRoughness = Root.bRandomRoughness ? 1 : 0;
 
 	CD3DX12_CPU_DESCRIPTOR_HANDLE TableBaseCPU;
 	CD3DX12_GPU_DESCRIPTOR_HANDLE TableBaseGPU;
