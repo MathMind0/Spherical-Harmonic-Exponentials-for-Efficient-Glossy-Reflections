@@ -27,17 +27,23 @@ static const uint32_t GSHECoeffLUTMaxBasis = 16;   // Max PCA basis vectors (N).
 static const uint32_t GSHECoeffLUTMaxFloat4 = 1024; // LUT buffer capacity (mean+basis+weights).
 
 // The 33 specular coefficients grouped by SH band (order l).
-// P (5-band, indices 0..24): l0=1, l1=3, l2=5, l3=7, l4=9.
-// Q (3-band, indices 25..32, DC dropped): l1=3, l2=5.
-static const int GCoeffBandCount = 5;
-static const char *GCoeffBandLabels[5] = {"l=0", "l=1", "l=2", "l=3", "l=4"};
-static const int GCoeffBandCoeffCount[5] = {1, 6, 10, 7, 9};
-static const int GCoeffBandIndices[5][10] = {
-	{0, -1, -1, -1, -1, -1, -1, -1, -1, -1},
-	{1, 2, 3, 25, 26, 27, -1, -1, -1, -1},
-	{4, 5, 6, 7, 8, 28, 29, 30, 31, 32},
-	{9, 10, 11, 12, 13, 14, 15, -1, -1, -1},
-	{16, 17, 18, 19, 20, 21, 22, 23, 24, -1},
+// Standard SH: order l has (2*l + 1) coefficients, i.e. 1 / 3 / 5 / 7 / 9 ...
+// P is a 5-band SH (indices 0..24): l=0..4 -> 1, 3, 5, 7, 9.
+// Q is a 3-band SH with its DC dropped (indices 25..32): l=1, 2 -> 3, 5.
+// P and Q are kept as separate bands (both l=1 / l=2 appear) so every band
+// column holds exactly its (2*l + 1) parameters and all 33 are covered.
+static const int GCoeffBandCount = 7;
+static const char *GCoeffBandLabels[GCoeffBandCount] = {
+	"P l=0", "P l=1", "P l=2", "P l=3", "P l=4", "Q l=1", "Q l=2"};
+static const int GCoeffBandCoeffCount[GCoeffBandCount] = {1, 3, 5, 7, 9, 3, 5};
+static const int GCoeffBandIndices[GCoeffBandCount][9] = {
+	{0,  -1, -1, -1, -1, -1, -1, -1, -1}, // P l=0  (1)
+	{1,  2,  3,  -1, -1, -1, -1, -1, -1}, // P l=1  (3)
+	{4,  5,  6,  7,  8,  -1, -1, -1, -1}, // P l=2  (5)
+	{9,  10, 11, 12, 13, 14, 15, -1, -1}, // P l=3  (7)
+	{16, 17, 18, 19, 20, 21, 22, 23, 24}, // P l=4  (9)
+	{25, 26, 27, -1, -1, -1, -1, -1, -1}, // Q l=1  (3)
+	{28, 29, 30, 31, 32, -1, -1, -1, -1}, // Q l=2  (5)
 };
 
 // CPU-side copy of the grouped-fit coefficients, used by both the render path
@@ -55,6 +61,12 @@ struct FSHECoeffTable
 	// baseline, accumulated per band and in total. Computed for the UI table.
 	float BandVariance[GSHECoeffLUTMaxGroups][GCoeffBandCount]; // [group][band]; variance vs ungrouped baseline.
 	float TotalVariance[GSHECoeffLUTMaxGroups];    // [group]; variance over all 33 coefficients.
+	// PCA data (filled by UploadCoeffLUT when PCA is active), for the ImGui table:
+	int PCABasisCount = 0;                          // number of active basis vectors (N).
+	float PCABasisCoeff[GSHECoeffLUTMaxBasis][GSHECoeffPerGroup][4]; // [k][i][c] basis k value of parameter i.
+	float PCABasisExplained[GSHECoeffLUTMaxBasis];  // [k] fraction of total variance captured by basis k.
+	float PCABandVariance[GSHECoeffLUTMaxGroups][GCoeffBandCount]; // [g][b] var of original vs PCA reconstruction.
+	float PCATotalVariance[GSHECoeffLUTMaxGroups];  // [g] total var of original vs PCA reconstruction.
 };
 
 static float HalfToFloat(uint16_t H)
@@ -1935,6 +1947,7 @@ static void UploadCoeffLUT(FDemoRoot &Root)
 				LUT[g * 34 + i] = XMFLOAT4(T.Coeff[g][i][0], T.Coeff[g][i][1], T.Coeff[g][i][2], 0.0f);
 		Root.ActivePCABasisCount = 0;
 		Root.PCAExplainedVariance = 1.0f;
+		T.PCABasisCount = 0; // no PCA basis rows / PCA variance to show
 		return;
 	}
 
@@ -1987,9 +2000,17 @@ static void UploadCoeffLUT(FDemoRoot &Root)
 	for (int k = 0; k < G; ++k) totalVar += lam[k];
 	for (int k = 0; k < N; ++k) keptVar += lam[k];
 	Root.PCAExplainedVariance = totalVar > 1e-12 ? (float)(keptVar / totalVar) : 1.0f;
+	T.PCABasisCount = N;
 
 	for (int i = 0; i < 34; ++i) // mean
 		LUT[i] = XMFLOAT4(mean[i * 3 + 0], mean[i * 3 + 1], mean[i * 3 + 2], 0.0f);
+
+	// Reconstruct every group from the retained top-N basis (mean + sum w_k*basis_k)
+	// and mirror basis vectors into the coefficient table for the ImGui display.
+	float recon[GSHECoeffLUTMaxGroups][102];
+	for (int g = 0; g < G; ++g)
+		for (int d = 0; d < D; ++d)
+			recon[g][d] = mean[d];
 
 	const int WeightBase = 34 + N * 34;
 	for (int k = 0; k < N; ++k)
@@ -2003,13 +2024,48 @@ static void UploadCoeffLUT(FDemoRoot &Root)
 			for (int d = 0; d < D; ++d) basis[d] += (float)(coef * y[g][d]);
 		}
 		for (int i = 0; i < 34; ++i)
+		{
 			LUT[34 + k * 34 + i] = XMFLOAT4(basis[i * 3 + 0], basis[i * 3 + 1], basis[i * 3 + 2], 0.0f);
+			for (int c = 0; c < 3; ++c)
+				T.PCABasisCoeff[k][i][c] = basis[i * 3 + c];
+		}
+		T.PCABasisExplained[k] = totalVar > 1e-12 ? (float)(lam[k] / totalVar) : 0.0f;
 		for (int g = 0; g < G; ++g)
 		{
 			float w = 0.0f;
 			for (int d = 0; d < D; ++d) w += y[g][d] * basis[d];
 			LUT[WeightBase + g * N + k] = XMFLOAT4(w, 0.0f, 0.0f, 0.0f);
+			for (int d = 0; d < D; ++d)
+				recon[g][d] += w * basis[d];
 		}
+	}
+
+	// Per-band / total variance of each original group vs its PCA reconstruction.
+	// Only the 33 specular coefficients (band members) are included, matching
+	// the existing vs-ungrouped variance; autoBias (index 33) is excluded.
+	for (int g = 0; g < G; ++g)
+	{
+		float TotalSum = 0.0f;
+		int TotalN = 0;
+		for (int b = 0; b < GCoeffBandCount; ++b)
+		{
+			float BandSum = 0.0f;
+			int BandN = 0;
+			for (int k = 0; k < GCoeffBandCoeffCount[b]; ++k)
+			{
+				const int Idx = GCoeffBandIndices[b][k];
+				for (int c = 0; c < 3; ++c)
+				{
+					const float diff = T.Coeff[g][Idx][c] - recon[g][Idx * 3 + c];
+					BandSum += diff * diff;
+					++BandN;
+				}
+			}
+			T.PCABandVariance[g][b] = BandN > 0 ? BandSum / BandN : 0.0f;
+			TotalSum += BandSum;
+			TotalN += BandN;
+		}
+		T.PCATotalVariance[g] = TotalN > 0 ? TotalSum / TotalN : 0.0f;
 	}
 }
 
@@ -2243,6 +2299,9 @@ static void ComputeGroupedSHEFit(FDemoRoot &Root)
 // ImGui table: one row per roughness group (+ ungrouped baseline), 33 SHE
 // coefficients grouped by SH band, with per-band and total variance vs the
 // ungrouped fit. Uses ImGui 1.72 legacy Columns API.
+// ImGui table: one row per roughness group (+ ungrouped baseline + PCA basis),
+// 33 SHE coefficients grouped by SH band (2*l + 1 per band), with per-band and
+// total variance columns. Uses ImGui 1.72 legacy Columns API.
 static void DrawSHECoeffTable(FDemoRoot &Root)
 {
 	ImGui::SetNextWindowSize(ImVec2(1180.0f, 460.0f), ImGuiCond_FirstUseEver);
@@ -2260,22 +2319,25 @@ static void DrawSHECoeffTable(FDemoRoot &Root)
 		return;
 	}
 	const int N = T.BakeRoughnessCount;
+	const bool bPCA = Root.bUsePCA && T.PCABasisCount > 0;
 	ImGui::Text("Groups: %d   Bake range: [%.2f, %.2f]", N, T.RoughnessStart, T.RoughnessEnd);
 	if (Root.bUsePCA)
 	{
 		ImGui::Text("PCA: %d / %d basis vectors, explained variance %.1f%%",
 			Root.ActivePCABasisCount, Root.PCABasisCount, Root.PCAExplainedVariance * 100.0f);
 	}
-	ImGui::TextDisabled("Cells show the 33 coefficients (luma) grouped by SH band; v= per-band MSE vs ungrouped; last column = total MSE.");
+	ImGui::TextDisabled("Cells: 33 coefficients (luma) per SH band (2l+1). vU= MSE vs Ungrouped, vP= MSE vs PCA recon.");
 
 	const int NumCols = 1 + GCoeffBandCount + 1;
 	ImGui::Columns(NumCols, "shecoefftable", true);
-	ImGui::SetColumnWidth(0, 96.0f);
+	ImGui::SetColumnWidth(0, 110.0f);
+	// Each band column width scales with its (2l+1) parameter count so wider
+	// bands get proportionally more room (TextWrapped still avoids clipping).
 	for (int b = 0; b < GCoeffBandCount; ++b)
 	{
-		ImGui::SetColumnWidth(1 + b, 244.0f);
+		ImGui::SetColumnWidth(1 + b, 30.0f + 28.0f * (float)GCoeffBandCoeffCount[b]);
 	}
-	ImGui::SetColumnWidth(1 + GCoeffBandCount, 84.0f);
+	ImGui::SetColumnWidth(1 + GCoeffBandCount, 96.0f);
 
 	ImGui::TextDisabled("Group");
 	ImGui::NextColumn();
@@ -2289,21 +2351,14 @@ static void DrawSHECoeffTable(FDemoRoot &Root)
 	ImGui::Separator();
 
 	char Buf[512];
-	for (int Row = 0; Row <= N; ++Row)
+	// Emit the GCoeffBandCount coefficient cells for one row. Optional variance
+	// caption lines (vU = vs ungrouped, vP = vs PCA reconstruction) are appended
+	// under each cell; the total column shows the corresponding total variance(s).
+	auto EmitRow = [&](const float Coeff[GSHECoeffPerGroup][4],
+		const float *VarU, float TotU, bool bShowU,
+		const float *VarP, float TotP, bool bShowP,
+		const char *NoVarCaption)
 	{
-		const bool bBaseline = (Row == N);
-		if (bBaseline)
-		{
-			ImGui::Text("Ungrouped");
-		}
-		else
-		{
-			const float Denom = (float)(N > 1 ? N - 1 : 1);
-			const float R = T.RoughnessStart + (float)Row / Denom * (T.RoughnessEnd - T.RoughnessStart);
-			ImGui::Text("R=%.2f", R);
-		}
-		ImGui::NextColumn();
-
 		for (int b = 0; b < GCoeffBandCount; ++b)
 		{
 			char *p = Buf;
@@ -2311,36 +2366,54 @@ static void DrawSHECoeffTable(FDemoRoot &Root)
 			for (int k = 0; k < GCoeffBandCoeffCount[b]; ++k)
 			{
 				const int Idx = GCoeffBandIndices[b][k];
-				const float Luma = (T.Coeff[Row][Idx][0] + T.Coeff[Row][Idx][1] + T.Coeff[Row][Idx][2]) / 3.0f;
-				const int Written = EA::StdC::Snprintf(p, Rem, "%.2f ", Luma);
-				if (Written < 0 || (size_t)Written >= Rem)
-				{
-					break;
-				}
-				p += Written;
-				Rem -= Written;
+				const float Luma = (Coeff[Idx][0] + Coeff[Idx][1] + Coeff[Idx][2]) / 3.0f;
+				const int W = EA::StdC::Snprintf(p, Rem, "%.2f ", Luma);
+				if (W < 0 || (size_t)W >= Rem) break;
+				p += W;
+				Rem -= W;
 			}
 			ImGui::TextWrapped("%s", Buf);
-			if (bBaseline)
-			{
-				ImGui::TextDisabled("baseline");
-			}
-			else
-			{
-				ImGui::TextDisabled("v=%.3g", T.BandVariance[Row][b]);
-			}
+			if (bShowU && VarU) ImGui::TextDisabled("vU=%.3g", VarU[b]);
+			if (bShowP && VarP) ImGui::TextDisabled("vP=%.3g", VarP[b]);
+			if (!bShowU && !bShowP && NoVarCaption) ImGui::TextDisabled("%s", NoVarCaption);
 			ImGui::NextColumn();
 		}
-		if (bBaseline)
-		{
-			ImGui::TextDisabled("-");
-		}
-		else
-		{
-			ImGui::Text("%.3g", T.TotalVariance[Row]);
-		}
+		if (bShowU) ImGui::Text("U=%.3g", TotU);
+		if (bShowP) ImGui::Text("P=%.3g", TotP);
+		if (!bShowU && !bShowP) ImGui::TextDisabled("-");
 		ImGui::NextColumn();
+	};
+
+	// ---- Group rows: coefficients + vs-ungrouped variance + (optional) PCA variance
+	for (int g = 0; g < N; ++g)
+	{
+		const float Denom = (float)(N > 1 ? N - 1 : 1);
+		const float R = T.RoughnessStart + (float)g / Denom * (T.RoughnessEnd - T.RoughnessStart);
+		ImGui::Text("R=%.2f", R);
+		ImGui::NextColumn();
+		EmitRow(T.Coeff[g],
+			T.BandVariance[g], T.TotalVariance[g], true,
+			bPCA ? T.PCABandVariance[g] : nullptr, bPCA ? T.PCATotalVariance[g] : 0.0f, bPCA,
+			nullptr);
 	}
+
+	// ---- Ungrouped baseline ----
+	ImGui::Text("Ungrouped");
+	ImGui::NextColumn();
+	EmitRow(T.Coeff[N], nullptr, 0.0f, false, nullptr, 0.0f, false, "baseline");
+
+	// ---- PCA basis rows (directly below Ungrouped), same band grid ----
+	if (bPCA)
+	{
+		ImGui::Separator();
+		for (int k = 0; k < T.PCABasisCount; ++k)
+		{
+			ImGui::Text("PCA B%d (%.1f%%)", k, T.PCABasisExplained[k] * 100.0f);
+			ImGui::NextColumn();
+			EmitRow(T.PCABasisCoeff[k], nullptr, 0.0f, false, nullptr, 0.0f, false, nullptr);
+		}
+	}
+
 	ImGui::Columns(1);
 	ImGui::End();
 }
