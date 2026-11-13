@@ -1,5 +1,6 @@
 #include "Library.h"
 #include "CPUAndGPUCommon.h"
+#include "Shaders/SHBasis.h"
 #include "d3dx12.h"
 #include "imgui/imgui.h"
 #include "EAStdC/EAStdC.h"
@@ -52,7 +53,7 @@ struct FSHECoeffTable
 {
 	int Valid = 0;                      // 1 when the table has been computed at least once.
 	int BakeRoughnessCount = 0;         // Number of roughness groups baked when this table was built.
-	float RoughnessStart = 0.4f;        // Roughness of group 0.
+	float RoughnessStart = 0.0f;        // Roughness of group 0.
 	float RoughnessEnd = 1.0f;          // Roughness of the last group.
 	// Index 0..N-1: per-roughness grouped fit. Index N: ungrouped (global) fit.
 	// Each Coeff[group] holds 34 float4 (33 specular + autoBias), only .xyz used.
@@ -225,13 +226,20 @@ struct FStaticMesh
 	uint32_t BaseVertexLocation;
 };
 
-// Draw order of the IBL mode groups shown top-to-bottom in the sphere array.
-static const int GIBLModeGroupOrder[3] =
+// Vertical order of the IBL groups in the sphere grid. Row 0 is drawn at the
+// BOTTOM of the screen (local +Y points up), so GIBLModeGroupOrder[0] is the
+// bottom group and [3] is the top group. 4 groups x 2 metallic rows = 8 rows.
+// Classic SH sits in the bottom two rows, directly below the SHE rows, for a
+// side-by-side comparison of the traditional SH path against SHE.
+// Screen top-to-bottom: Split-Sum / Reference / SHE / Classic SH.
+static const int GIBLModeGroupOrder[4] =
 {
+	IBL_MODE_CLASSIC_SH,
 	IBL_MODE_SPHERICAL_HARMONICS_EXPONENTIAL,
 	IBL_MODE_REFERENCE,
 	IBL_MODE_SPLIT_SUM_APPROXIMATION,
 };
+static const int GIBLModeGroupCount = 4;
 
 // Mouse orbit camera control parameters.
 static const float GCameraRotateSpeed = 0.005f;	   // Radians per pixel of mouse drag.
@@ -286,6 +294,10 @@ struct FDemoRoot
 	ID3D12Resource *SHECoeffLUT;               // StructuredBuffer<float4>, flat [group*34 + i].
 	D3D12_CPU_DESCRIPTOR_HANDLE SHECoeffLUTSRV; // SRV bound at t5 in the SimpleForward descriptor table.
 	void *SHECoeffLUTMapped = nullptr;          // Persistently mapped CPU write pointer (upload heap).
+	ID3D12Resource *ClassicSHCoeff = nullptr;       // Upload buffer: StructuredBuffer<float4> of SH projection coefficients.
+	D3D12_CPU_DESCRIPTOR_HANDLE ClassicSHCoeffSRV;  // SRV bound at t6 in the SimpleForward descriptor table.
+	void *ClassicSHCoeffMapped = nullptr;           // Persistently mapped CPU write pointer.
+	int ClassicSHOrder = 3;                         // Classic SH band count (order 2..10), default 3-band.
 	D3D12_CPU_DESCRIPTOR_HANDLE EnvMapSRV;
 	D3D12_CPU_DESCRIPTOR_HANDLE IrradianceMapSRV;
 	D3D12_CPU_DESCRIPTOR_HANDLE PrefilteredEnvMapSRV;
@@ -307,8 +319,8 @@ struct FDemoRoot
 	int EnvironmentMapIndex;
 	int SelectedEnvironmentMapIndex;
 	int PendingEnvironmentMapIndex;
-	float RoughnessStart = 0.4f; // Display grid roughness sweep start (end fixed at 1.0).
-	float BakeRoughnessStart = 0.4f; // SHE bake roughness range start.
+	float RoughnessStart = 0.0f; // Display grid roughness sweep start (end fixed at 1.0).
+	float BakeRoughnessStart = 0.0f; // SHE bake roughness range start.
 	float BakeRoughnessEnd = 1.0f; // SHE bake roughness range end.
 	int BakeRoughnessCount = 4; // SHE bake roughness levels.
 	int PendingSHEBake = 0; // 1 = re-run the SHE precomputation with the current bake parameters.
@@ -357,7 +369,16 @@ static void UpdateUI(FDemoRoot &Root, float DeltaTime)
 
 	{
 		ImGui::Text("IBL Mode");
-		ImGui::TextDisabled("SHE / Reference / Split-Sum (shown as 3 groups)");
+		ImGui::TextDisabled("Top: Split-Sum / Ref / SHE / Classic SH :Bottom");
+	}
+
+	{
+		ImGui::Text("Classic SH Order");
+		ImGui::TextDisabled("Band count for the classic SH IBL rows (l = 0 .. order-1)");
+		if (ImGui::SliderInt("##ClassicSHOrder", &Root.ClassicSHOrder, 2, SH_CLASSIC_MAX_ORDER, "Order %d"))
+		{
+			Root.NumFrames = 0;
+		}
 	}
 
 	{
@@ -562,14 +583,14 @@ static void Draw(FDemoRoot &Root)
 
 	const XMMATRIX ViewTransform = XMMatrixLookAtLH(XMLoadFloat3(&Root.CameraPosition), XMLoadFloat3(&Root.CameraFocusPosition), XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f));
 
-	// Projection: orthographic fits the 10x6 sphere grid with margin (grid spans
-	// 22 x 13.2 units). Perspective uses the orbit distance to frame the grid.
+	// Projection: orthographic fits the 11x8 sphere grid with margin (grid spans
+	// 24.2 x 17.6 units). Perspective uses the orbit distance to frame the grid.
 	XMMATRIX ProjectionTransform;
 	if (Root.bOrthographicProjection)
 	{
 		const float AspectRatio = (float)Gfx.Resolution[0] / (float)Gfx.Resolution[1];
-		const float GridWidth = 10 * 2.2f;
-		const float GridHeight = 6 * 2.2f;
+		const float GridWidth = 11 * 2.2f;
+		const float GridHeight = 8 * 2.2f;
 		float ViewWidth = GridWidth + 4.0f;
 		float ViewHeight = ViewWidth / AspectRatio;
 		if (ViewHeight < GridHeight + 2.0f)
@@ -586,8 +607,8 @@ static void Draw(FDemoRoot &Root)
 		// Perspective FOV derived so that at the current orbit distance the grid
 		// (with the same margin) fills the viewport similarly to the ortho view.
 		const float AspectRatio = (float)Gfx.Resolution[0] / (float)Gfx.Resolution[1];
-		const float GridWidth = 10 * 2.2f;
-		const float GridHeight = 6 * 2.2f;
+		const float GridWidth = 11 * 2.2f;
+		const float GridHeight = 8 * 2.2f;
 		float ViewWidth = GridWidth + 4.0f;
 		float ViewHeight = ViewWidth / AspectRatio;
 		if (ViewHeight < GridHeight + 2.0f)
@@ -664,8 +685,8 @@ static void Draw(FDemoRoot &Root)
 			ImDrawList *LabelDrawList = ImGui::GetBackgroundDrawList();
 			const ImGuiIO &LabelIO = ImGui::GetIO();
 
-			const int32_t NumRows = 6;
-			const int32_t NumColumns = 10;
+			const int32_t NumRows = 8;
+			const int32_t NumColumns = 11;
 			const float CellSize = 2.2f;
 			// Anchor slightly above the top row of spheres.
 			const float LabelY = CellSize * (-NumRows * 0.5f + (NumRows - 1) + 0.5f) + CellSize * 0.65f;
@@ -705,7 +726,7 @@ static void Draw(FDemoRoot &Root)
 			}
 		}
 
-		for (int32_t GroupIdx = 0; GroupIdx < 3; ++GroupIdx)
+		for (int32_t GroupIdx = 0; GroupIdx < GIBLModeGroupCount; ++GroupIdx)
 		{
 		const int GroupIBLMode = GIBLModeGroupOrder[GroupIdx];
 
@@ -746,10 +767,11 @@ static void Draw(FDemoRoot &Root)
 			CPUAddress->SHECoeffLUTRoughnessEnd = Root.CoeffTable.RoughnessEnd;
 			CPUAddress->bUsePCA = (Root.bUsePCA && Root.CoeffTable.Valid) ? 1 : 0;
 			CPUAddress->SHEPCABasisCount = (Root.bUsePCA && Root.CoeffTable.Valid) ? Root.ActivePCABasisCount : 0;
+			CPUAddress->ClassicSHOrder = Root.ClassicSHOrder;
 
 			CD3DX12_CPU_DESCRIPTOR_HANDLE TableBaseCPU;
 			CD3DX12_GPU_DESCRIPTOR_HANDLE TableBaseGPU;
-			AllocateGPUDescriptors(Gfx, 8, TableBaseCPU, TableBaseGPU);
+			AllocateGPUDescriptors(Gfx, 9, TableBaseCPU, TableBaseGPU);
 
 			D3D12_CONSTANT_BUFFER_VIEW_DESC CBVDesc = {};
 			CBVDesc.BufferLocation = GPUAddress;
@@ -777,6 +799,9 @@ static void Draw(FDemoRoot &Root)
 			TableBaseCPU.Offset(Gfx.DescriptorSize);
 
 			Gfx.Device->CopyDescriptorsSimple(1, TableBaseCPU, Root.SHECoeffLUTSRV, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+			TableBaseCPU.Offset(Gfx.DescriptorSize);
+
+			Gfx.Device->CopyDescriptorsSimple(1, TableBaseCPU, Root.ClassicSHCoeffSRV, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 			TableBaseCPU.Offset(Gfx.DescriptorSize);
 
 			CmdList->SetGraphicsRootDescriptorTable(1, TableBaseGPU);
@@ -1845,6 +1870,97 @@ static void CreateSHECoeffLUTResources(FDemoRoot &Root)
 	Gfx.Device->CreateShaderResourceView(Root.SHECoeffLUT, &S, Root.SHECoeffLUTSRV);
 }
 
+// Classic SH IBL: create the persistently-mapped upload buffer that holds the
+// projected radiance coefficients (StructuredBuffer<float4> of length
+// SH_CLASSIC_COEFF_COUNT). Bound as SRV at t6 in the SimpleForward table.
+static void CreateClassicSHCoeffResources(FDemoRoot &Root)
+{
+	FGraphicsContext &Gfx = Root.Gfx;
+	const UINT64 BufferSize = (UINT64)SH_CLASSIC_COEFF_COUNT * sizeof(float4);
+	const D3D12_RESOURCE_DESC Desc = CD3DX12_RESOURCE_DESC::Buffer(BufferSize);
+	VHR(Gfx.Device->CreateCommittedResource(
+		get_rvalue_ptr(CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD)), D3D12_HEAP_FLAG_NONE,
+		&Desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&Root.ClassicSHCoeff)));
+	CD3DX12_RANGE ReadRange(0, 0);
+	VHR(Root.ClassicSHCoeff->Map(0, &ReadRange, &Root.ClassicSHCoeffMapped));
+	memset(Root.ClassicSHCoeffMapped, 0, (size_t)BufferSize);
+
+	Root.ClassicSHCoeffSRV = AllocateDescriptors(Gfx, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
+	D3D12_SHADER_RESOURCE_VIEW_DESC S = {};
+	S.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+	S.Format = DXGI_FORMAT_UNKNOWN;
+	S.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	S.Buffer.NumElements = SH_CLASSIC_COEFF_COUNT;
+	S.Buffer.StructureByteStride = sizeof(float4);
+	Gfx.Device->CreateShaderResourceView(Root.ClassicSHCoeff, &S, Root.ClassicSHCoeffSRV);
+}
+
+// Project the current equirectangular HDR environment onto real spherical
+// harmonics up to l = SH_CLASSIC_MAX_BANDS. The direction convention matches
+// EquirectangularToCube.hlsl / SampleSphericalMap: with stb flipped on load,
+//   phi   = 2*pi * (u - 0.5)
+//   theta = pi * (0.5 - v)
+//   dir   = (sin(theta)*cos(phi), cos(theta), sin(theta)*sin(phi))
+// and the SH basis (SHBasis.h) uses +z as polar axis, so we pass
+// (dir.z, dir.x, dir.y) to align the basis with the world-space cubemap that
+// the split-sum / SHE paths sample (their directions are x/y/z world axes).
+static void ProjectEnvMapToSH(FDemoRoot &Root)
+{
+	int Width = 0, Height = 0;
+	stbi_set_flip_vertically_on_load(1);
+	float *HDR = stbi_loadf(GEnvironmentMapPaths[Root.EnvironmentMapIndex], &Width, &Height, nullptr, 3);
+	stbi_set_flip_vertically_on_load(0);
+	EA_ASSERT(HDR && Width > 0 && Height > 0);
+
+	const double PI_D = 3.14159265358979323846;
+	const double dPhi = 2.0 * PI_D / (double)Width;
+	const double dElev = PI_D / (double)Height;
+	double Acc[SH_CLASSIC_COEFF_COUNT][3] = {};
+	for (int iy = 0; iy < Height; ++iy)
+	{
+		// Row 0 of the (vertically flipped) buffer is the GPU texture row at
+		// v = 0. EquirectangularToCube.hlsl maps a world direction V to
+		//   u   = atan2(V.z, V.x)/(2*pi) + 0.5
+		//   v   = asin(V.y)/pi + 0.5      (=> V.y = sin(e), e = pi*(v-0.5))
+		// Invert that here to recover the world direction for this texel.
+		const double v = (iy + 0.5) / (double)Height;
+		const double e = PI_D * (v - 0.5);   // asin(V.y)
+		const double sinE = sin(e);           // V.y
+		const double cosE = cos(e);           // horizontal magnitude >= 0
+		const double dOmega = cosE * dPhi * dElev;
+		for (int ix = 0; ix < Width; ++ix)
+		{
+			const double u = (ix + 0.5) / (double)Width;
+			const double phi = 2.0 * PI_D * (u - 0.5); // atan2(V.z, V.x)
+			const float vx = (float)(cosE * cos(phi));
+			const float vy = (float)sinE;
+			const float vz = (float)(cosE * sin(phi));
+
+			// The SH basis in SHBasis.h uses +z as the polar axis; evaluate it
+			// at the SAME world vector used to look up the environment. This
+			// keeps projection consistent with the forward-shader reconstruction
+			// (which evaluates the basis at world-space N / R).
+			float Basis[SH_CLASSIC_COEFF_COUNT];
+			SHBasisEval(vx, vy, vz, Basis);
+
+			const float *Pixel = HDR + (size_t)(iy * Width + ix) * 3;
+			for (int k = 0; k < SH_CLASSIC_COEFF_COUNT; ++k)
+			{
+				Acc[k][0] += (double)Pixel[0] * Basis[k] * dOmega;
+				Acc[k][1] += (double)Pixel[1] * Basis[k] * dOmega;
+				Acc[k][2] += (double)Pixel[2] * Basis[k] * dOmega;
+			}
+		}
+	}
+	stbi_image_free(HDR);
+
+	auto *Dst = (float4 *)Root.ClassicSHCoeffMapped;
+	for (int k = 0; k < SH_CLASSIC_COEFF_COUNT; ++k)
+	{
+		Dst[k] = {(float)Acc[k][0], (float)Acc[k][1], (float)Acc[k][2], 0.0f};
+	}
+}
+
 // Jacobi eigen-decomposition of a symmetric n x n matrix (Numerical Recipes).
 // a[][] is overwritten; eigenvalues returned in d[], eigenvector j is the
 // j-th column of v[][] (v[i][j] = component i of eigenvector j).
@@ -2529,6 +2645,11 @@ static void FinishEnvironmentPrecomputation(FDemoRoot &Root, eastl::vector<ID3D1
 	// Build the grouped-fit LUT and coefficient table from the freshly baked
 	// SHE matrices (GPU is idle here, so the readback is safe).
 	ComputeGroupedSHEFit(Root);
+
+	// Re-project the (possibly new) HDR environment onto classic SH coefficients.
+	// This is a CPU-side integral over the equirectangular HDR, independent of
+	// the GPU bake above, so run it here where all environment state is settled.
+	ProjectEnvMapToSH(Root);
 }
 
 static void RebuildEnvironment(FDemoRoot &Root)
@@ -2819,6 +2940,7 @@ static void Initialize(FDemoRoot &Root)
 	CreateUIContext(Gfx, Root.NumSamples, Root.UI, TempResources);
 	CreatePipelines(Gfx, Root.NumSamples, Root.Pipelines, Root.RootSignatures, Root.WaveSize);
 	CreateSHECoeffLUTResources(Root);
+	CreateClassicSHCoeffResources(Root);
 
 	eastl::vector<FVertex> AllVertices;
 	eastl::vector<uint32_t> AllIndices;
@@ -2834,8 +2956,8 @@ static void Initialize(FDemoRoot &Root)
 			Root.StaticMeshes.push_back(FStaticMesh{Mesh.Sections[0].IndexCount, Mesh.Sections[0].StartIndexLocation, Mesh.Sections[0].BaseVertexLocation});
 		}
 
-		const int32_t NumRows = 6;    // 3 IBL groups x 2 metallic rows.
-		const int32_t NumColumns = 10; // Roughness from RoughnessStart to 1.
+		const int32_t NumRows = 8;     // 4 IBL groups x 2 metallic rows.
+		const int32_t NumColumns = 11; // Roughness from RoughnessStart to 1.
 		const float CellSize = 2.2f;
 		for (int32_t RowIdx = 0; RowIdx < NumRows; ++RowIdx)
 		{
@@ -2996,6 +3118,11 @@ static void Shutdown(FDemoRoot &Root)
 		Root.SHECoeffLUT->Unmap(0, nullptr);
 	}
 	SAFE_RELEASE(Root.SHECoeffLUT);
+	if (Root.ClassicSHCoeff)
+	{
+		Root.ClassicSHCoeff->Unmap(0, nullptr);
+	}
+	SAFE_RELEASE(Root.ClassicSHCoeff);
 	SAFE_RELEASE(Root.MSColorBuffer);
 	SAFE_RELEASE(Root.MSDepthBuffer);
 	SAFE_RELEASE(Root.AccumulationBuffer);

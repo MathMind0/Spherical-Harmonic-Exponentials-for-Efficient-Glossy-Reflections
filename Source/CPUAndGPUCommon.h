@@ -18,10 +18,18 @@ typedef XMFLOAT4 float4;
 #define IBL_MODE_SPLIT_SUM_APPROXIMATION 0
 #define IBL_MODE_SPHERICAL_HARMONICS_EXPONENTIAL 1
 #define IBL_MODE_REFERENCE 2
+#define IBL_MODE_CLASSIC_SH 3
 
 #define MATERIAL_MODE_DIFFUSE_AND_SPECULAR 0
 #define MATERIAL_MODE_DIFFUSE_ONLY 1
 #define MATERIAL_MODE_SPECULAR_ONLY 2
+
+// Classic (standard) SH IBL: the environment radiance is projected onto real
+// spherical harmonics up to 9th order (l = 0..9, 100 coefficients). The
+// forward shader truncates to the band count selected in the UI (order 2..10).
+#define SH_CLASSIC_MAX_ORDER 10
+#define SH_CLASSIC_MAX_BANDS (SH_CLASSIC_MAX_ORDER - 1)
+#define SH_CLASSIC_COEFF_COUNT (SH_CLASSIC_MAX_ORDER * SH_CLASSIC_MAX_ORDER)
 
 struct SALIGN FPerDrawConstantData
 {
@@ -49,6 +57,7 @@ struct SALIGN FPerFrameConstantData
 	float SHECoeffLUTRoughnessEnd;   // Roughness value represented by the last LUT group.
 	int bUsePCA;                     // 1 = reconstruct LUT coefficients from PCA basis + weights.
 	int SHEPCABasisCount;            // Number of PCA basis vectors actually active (N).
+	int ClassicSHOrder;              // Classic SH IBL band count (2..10), l = 0 .. ClassicSHOrder-1.
 };
 
 struct SALIGN FSHEBuildConstantData
@@ -82,6 +91,13 @@ struct SALIGN FSHEDiffuseParams
 struct SALIGN FSHECoefficientConstantData
 {
 	float4 Coeffs[44]; // [0..32] SHE specular coefficients, [33] auto bias, [34..42] 3-band SH diffuse irradiance, [43] unused.
+};
+
+// Classic SH IBL: SH_CLASSIC_COEFF_COUNT RGB radiance projection coefficients
+// (projection L_lm = integral L(s) Y_lm(s) ds). Stored one float4 per coefficient.
+struct SALIGN FClassicSHCoefficientConstantData
+{
+	float4 Coeffs[SH_CLASSIC_COEFF_COUNT];
 };
 
 #ifdef __cplusplus

@@ -1,11 +1,12 @@
 #include "../CPUAndGPUCommon.h"
 #include "Common.hlsli"
 #include "SHE_Math.hlsli"
+#include "SHBasis.h"
 
 #define GRootSignature                                                                                                       \
 	"RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT), "                                                                        \
 	"CBV(b0), "                                                                                                              \
-	"DescriptorTable(CBV(b1), CBV(b2), SRV(t0), SRV(t1), SRV(t2), SRV(t3), SRV(t4), SRV(t5), visibility = SHADER_VISIBILITY_PIXEL), " \
+	"DescriptorTable(CBV(b1), CBV(b2), SRV(t0), SRV(t1), SRV(t2), SRV(t3), SRV(t4), SRV(t5), SRV(t6), visibility = SHADER_VISIBILITY_PIXEL), " \
 	"StaticSampler("                                                                                                         \
 	"s0, "                                                                                                                   \
 	"filter = FILTER_MIN_MAG_MIP_LINEAR, "                                                                                   \
@@ -23,6 +24,7 @@ TextureCube GEnvMap : register(t2);
 Texture2D GBRDFIntegrationMap : register(t3);
 Texture2D GAccumulationBuffer : register(t4);
 StructuredBuffer<float4> GCoeffLUT : register(t5);
+StructuredBuffer<float4> GClassicSHCoeff : register(t6);
 SamplerState GSampler : register(s0);
 
 float3 FresnelSchlick(float CosTheta, float3 F0)
@@ -121,6 +123,61 @@ float3 FresnelSchlickRoughness(float CosTheta, float3 F0, float Roughness)
 		Diffuse = Irradiance * Albedo;
 
 		float3 PrefilteredColor = GPrefilteredEnvMap.SampleLevel(GSampler, R, Roughness * 5.0f).rgb;
+		float2 EnvBRDF = GBRDFIntegrationMap.SampleLevel(GSampler, float2(min(NoV, 0.999f), min(Roughness, 0.999f)), 0.0f).rg;
+		Specular = PrefilteredColor * (F0 * EnvBRDF.x + EnvBRDF.y);
+	}
+	else if (GPerFrameCB.IBLMode == IBL_MODE_CLASSIC_SH)
+	{
+		// Standard (classic) SH IBL. One set of projected radiance coefficients
+		// is convolved with two different zonal kernels:
+		//   - clamped cosine -> diffuse irradiance E(N),
+		//   - vMF / GGX band-pass -> glossy prefiltered radiance along R.
+		// The "SH Order" UI slider truncates the band sum at l = 0..order-1,
+		// the classic band-limiting / detail control.
+		const int Order = clamp(GPerFrameCB.ClassicSHOrder, 2, SH_CLASSIC_MAX_ORDER);
+		const int MaxL = Order - 1;
+
+		// Zonal-harmonic coefficients k_l = 2*pi * integral_0^1 x P_l(x) dx
+		// of the clamped-cosine kernel (PI factor already included).
+		static const float CosKernel[SH_CLASSIC_MAX_ORDER] =
+		{
+			PI,                // l = 0
+			2.0f * PI / 3.0f, // l = 1
+			PI / 4.0f,        // l = 2
+			0.0f,             // l = 3
+			-PI / 24.0f,      // l = 4
+			0.0f,             // l = 5
+			PI / 64.0f,       // l = 6
+			0.0f,             // l = 7
+			-PI / 128.0f,     // l = 8
+			0.0f              // l = 9
+		};
+
+		float BasisN[SH_CLASSIC_COEFF_COUNT];
+		float BasisR[SH_CLASSIC_COEFF_COUNT];
+		SHBasisEval(N.x, N.y, N.z, BasisN);
+		SHBasisEval(R.x, R.y, R.z, BasisR);
+
+		float3 Irradiance = 0.0f;
+		float3 PrefilteredColor = 0.0f;
+
+		[loop]
+		for (int l = 0; l <= MaxL; ++l)
+		{
+			// vMF(l, 1/Roughness) = exp(-l(l+1) / (2 * (1/Roughness))).
+			const float VmfBand = exp(-float(l * (l + 1)) * Roughness * 0.5f);
+			[loop]
+			for (int m = -l; m <= l; ++m)
+			{
+				const int k = l * l + l + m;
+				const float3 Llm = GClassicSHCoeff[k].rgb;
+				Irradiance += CosKernel[l] * Llm * BasisN[k];
+				PrefilteredColor += VmfBand * Llm * BasisR[k];
+			}
+		}
+
+		Diffuse = max(Irradiance, float3(0.0f, 0.0f, 0.0f)) * (Albedo * (1.0f / PI));
+
 		float2 EnvBRDF = GBRDFIntegrationMap.SampleLevel(GSampler, float2(min(NoV, 0.999f), min(Roughness, 0.999f)), 0.0f).rg;
 		Specular = PrefilteredColor * (F0 * EnvBRDF.x + EnvBRDF.y);
 	}
@@ -288,7 +345,7 @@ float3 FresnelSchlickRoughness(float CosTheta, float3 F0, float Roughness)
 			if (NoL > 0.0f)
 			{
 				// Standard way of cosine importance sampling, no need to multiply by NoL.
-				Irradiance += GEnvMap.SampleLevel(GSampler, L, log2(256 * Roughness)).rgb;
+				Irradiance += GEnvMap.SampleLevel(GSampler, L, log2(max(256.0f * Roughness, 1.0f))).rgb;
 			}
 		}
 
@@ -306,7 +363,7 @@ float3 FresnelSchlickRoughness(float CosTheta, float3 F0, float Roughness)
 
 			if (NoL > 0.0f)
 			{
-				float3 Li = GEnvMap.SampleLevel(GSampler, L, log2(256 * Roughness)).rgb;
+				float3 Li = GEnvMap.SampleLevel(GSampler, L, log2(max(256.0f * Roughness, 1.0f))).rgb;
 				float G = GeometrySmith(NoL, NoV, Roughness);
 				float G_Vis = G * VoH / (NoH * NoV);
 				// GGX NDF sampling of H: the estimator is Li * F(VoH) * G * VoH / (NoH * NoV).
