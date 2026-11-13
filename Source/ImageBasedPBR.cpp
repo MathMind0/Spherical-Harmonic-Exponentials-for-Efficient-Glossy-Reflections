@@ -419,20 +419,26 @@ static void UpdateUI(FDemoRoot &Root, float DeltaTime)
 	{
 		ImGui::Text("SG Lobe Count");
 		ImGui::TextDisabled("Spherical Gaussians used to fit the environment");
-		if (ImGui::SliderInt("##SGLobeCount", &Root.SGLobeCount, 1, SG_MAX_LOBES, "Lobes %d"))
+		// Defer the CPU SG refit to the end of the interaction: each refit
+		// re-loads the HDR from disk, so doing it while the slider is being
+		// dragged would stall every intermediate value.
+		ImGui::SliderInt("##SGLobeCount", &Root.SGLobeCount, 1, SG_MAX_LOBES, "Lobes %d");
+		if (ImGui::IsItemDeactivatedAfterEdit())
 		{
 			Root.SGDirty = 1;
 			Root.NumFrames = 0;
 		}
 		const char *FitModes[] = {"Axis Fixed (uniform)", "Axis Free (fitted)"};
 		ImGui::Text("SG Fitting");
-		if (ImGui::Combo("##SGAxisMode", &Root.SGAxisMode, FitModes, IM_ARRAYSIZE(FitModes)))
+		ImGui::Combo("##SGAxisMode", &Root.SGAxisMode, FitModes, IM_ARRAYSIZE(FitModes));
+		if (ImGui::IsItemDeactivatedAfterEdit())
 		{
 			Root.SGAxisMode = XMMin(XMMax(Root.SGAxisMode, SG_FIT_FIXED_AXIS), SG_FIT_FREE_AXIS);
 			Root.SGDirty = 1;
 			Root.NumFrames = 0;
 		}
 		ImGui::TextDisabled("Fixed: axes on a uniform Fibonacci sphere; Free: axes move to fit");
+		ImGui::TextDisabled("SG refit runs on slider release");
 	}
 
 	{
@@ -474,15 +480,18 @@ static void UpdateUI(FDemoRoot &Root, float DeltaTime)
 		// layout, so it must trigger a full SHE rebake (not just a LUT repack).
 		ImGui::Text("SHE P / Q Orders");
 		ImGui::TextDisabled("P: R-direction SH order  Q: Hr-direction SH order");
-		if (ImGui::SliderInt("##SHEPOrder", &Root.SHEPOrder, 1, SHE_MAX_P, "P = %d"))
+		ImGui::SliderInt("##SHEPOrder", &Root.SHEPOrder, 1, SHE_MAX_P, "P = %d");
+		if (ImGui::IsItemDeactivatedAfterEdit())
 		{
 			Root.PendingSHEBake = 1;
 		}
-		if (ImGui::SliderInt("##SHEQOrder", &Root.SHEQOrder, 1, SHE_MAX_Q, "Q = %d"))
+		ImGui::SliderInt("##SHEQOrder", &Root.SHEQOrder, 1, SHE_MAX_Q, "Q = %d");
+		if (ImGui::IsItemDeactivatedAfterEdit())
 		{
 			Root.PendingSHEBake = 1;
 		}
 		ImGui::TextDisabled("Default P=5 Q=3 reproduces the original SH5 / SH3 SHE");
+		ImGui::TextDisabled("SHE rebake runs on slider release");
 	}
 
 	{
@@ -536,7 +545,10 @@ static void UpdateUI(FDemoRoot &Root, float DeltaTime)
 			Root.PCALUTDirty = 1;
 		}
 		ImGui::TextDisabled("Reconstruct coefficients from top-N PCA basis vectors");
-		if (ImGui::SliderInt("##PCABasisCount", &Root.PCABasisCount, 1, 16, "PCA Basis %d"))
+		// Defer to release: repacking runs a Jacobi eigen-decomposition over
+		// the PCA sample matrix, which is wasteful to redo per dragged value.
+		ImGui::SliderInt("##PCABasisCount", &Root.PCABasisCount, 1, 16, "PCA Basis %d");
+		if (ImGui::IsItemDeactivatedAfterEdit())
 		{
 			Root.PCALUTDirty = 1;
 		}
