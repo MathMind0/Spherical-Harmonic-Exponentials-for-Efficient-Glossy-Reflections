@@ -35,5 +35,5 @@ void MainCS()
         ReconstructedEnergy += exp(LogE0);
     }
 
-    GSHESHCoeff[GSHEReductionCB.SphericalHarmonicCount] = float4(log(max(TargetEnergy, 1e-6f) / max(ReconstructedEnergy, 1e-6f)), 0.0f);
+    GSHESHCoeff[SHE_AUTOBIAS_SLOT] = float4(log(max(TargetEnergy, 1e-6f) / max(ReconstructedEnergy, 1e-6f)), 0.0f);
 }

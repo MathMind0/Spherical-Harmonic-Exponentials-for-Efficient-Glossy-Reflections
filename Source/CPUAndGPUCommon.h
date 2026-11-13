@@ -19,10 +19,19 @@ typedef XMFLOAT4 float4;
 #define IBL_MODE_SPHERICAL_HARMONICS_EXPONENTIAL 1
 #define IBL_MODE_REFERENCE 2
 #define IBL_MODE_CLASSIC_SH 3
+#define IBL_MODE_SPHERICAL_GAUSSIAN 4
 
 #define MATERIAL_MODE_DIFFUSE_AND_SPECULAR 0
 #define MATERIAL_MODE_DIFFUSE_ONLY 1
 #define MATERIAL_MODE_SPECULAR_ONLY 2
+
+// SG (Spherical Gaussian) IBL: fit the environment radiance as a sum of
+// isotropic SGs a_i * exp(lambda_i * (dot(mu_i, v) - 1)). The UI selects the
+// lobe count (1..SG_MAX_LOBES) and the fitting algorithm: axes either stay at
+// a fixed Fibonacci-uniform sphere distribution, or are free to move.
+#define SG_MAX_LOBES 10
+#define SG_FIT_FIXED_AXIS 0   // Axes pinned to a uniform Fibonacci sphere set.
+#define SG_FIT_FREE_AXIS 1    // Axes refined to the radiance-weighted centroid.
 
 // Classic (standard) SH IBL: the environment radiance is projected onto real
 // spherical harmonics up to 9th order (l = 0..9, 100 coefficients). The
@@ -30,6 +39,43 @@ typedef XMFLOAT4 float4;
 #define SH_CLASSIC_MAX_ORDER 10
 #define SH_CLASSIC_MAX_BANDS (SH_CLASSIC_MAX_ORDER - 1)
 #define SH_CLASSIC_COEFF_COUNT (SH_CLASSIC_MAX_ORDER * SH_CLASSIC_MAX_ORDER)
+
+// =============================================================================
+// SHE (Spherical Harmonic Exponentials): the P and Q SH orders are now
+// INDEPENDENTLY configurable from the UI (P: 1..SHE_MAX_P, Q: 1..SHE_MAX_Q).
+//
+// The specular coefficient vector has a FIXED layout of SHE_SPEC_COEFFS slots
+// so every bake / reduction / solve / render stage can use a compile-time
+// constant dimension. The chosen P/Q orders only decide which slots carry
+// active features (unused slots are zero and contribute nothing). Layout:
+//   [0 .. SHE_P_COEFFS-1]            : P section  = Y_k(R),  k = 0 .. 99
+//   [SHE_Q_OFFSET .. SPEC-1]         : Q section  = Y_k(Hr), k = 1 .. 24
+//                                      (Q drops the DC term k=0)
+// With P order p only k < p*p of the P section is active; with Q order q only
+// k < q*q (k>=1) of the Q section is active. Both sections use the shared
+// SHBasisEval basis (up to 10th order) and vMF band weights.
+// Defaults P=5, Q=3 give 25 + 8 = 33 active coefficients, matching the
+// original SH5/SH3 SHE exactly (only the flat index of the Q section changes).
+// =============================================================================
+#define SHE_MAX_P 10
+#define SHE_MAX_Q 5
+#define SHE_P_COEFFS (SHE_MAX_P * SHE_MAX_P)            // 100
+#define SHE_Q_COEFFS (SHE_MAX_Q * SHE_MAX_Q - 1)        // 24 (k = 1..24)
+#define SHE_Q_OFFSET SHE_P_COEFFS                       // 100
+#define SHE_SPEC_COEFFS (SHE_P_COEFFS + SHE_Q_COEFFS)   // 124
+#define SHE_DIFFUSE_COEFFS 9                            // fixed 3-band SH diffuse
+
+// SHESHCoeff buffer slot layout (float4 each):
+//   [0 .. SHE_SPEC_COEFFS-1]                     : specular coefficients
+//   [SHE_SPEC_COEFFS]                            : auto bias (log-space energy)
+//   [SHE_DIFFUSE_BASE .. +SHE_DIFFUSE_COEFFS-1] : 3-band diffuse irradiance SH
+//   [last]                                       : spare (zeroed)
+#define SHE_AUTOBIAS_SLOT SHE_SPEC_COEFFS                    // 124
+#define SHE_DIFFUSE_BASE (SHE_SPEC_COEFFS + 1)               // 125
+#define SHE_COEFF_BUFFER_SIZE (SHE_DIFFUSE_BASE + SHE_DIFFUSE_COEFFS + 1) // 135
+
+// Per-group LUT / PCA stride: specular coefficients + auto bias.
+#define SHE_LUT_STRIDE (SHE_SPEC_COEFFS + 1)                 // 125
 
 struct SALIGN FPerDrawConstantData
 {
@@ -58,6 +104,10 @@ struct SALIGN FPerFrameConstantData
 	int bUsePCA;                     // 1 = reconstruct LUT coefficients from PCA basis + weights.
 	int SHEPCABasisCount;            // Number of PCA basis vectors actually active (N).
 	int ClassicSHOrder;              // Classic SH IBL band count (2..10), l = 0 .. ClassicSHOrder-1.
+	int SGLobeCount;                 // SG IBL lobe count (1..SG_MAX_LOBES).
+	int SGAxisMode;                  // SG_FIT_FIXED_AXIS or SG_FIT_FREE_AXIS (reflects the fitted data).
+	int SHEPOrder;                   // SHE P band count used by the current bake (1..SHE_MAX_P).
+	int SHEQOrder;                   // SHE Q band count used by the current bake (1..SHE_MAX_Q).
 };
 
 struct SALIGN FSHEBuildConstantData
@@ -67,10 +117,12 @@ struct SALIGN FSHEBuildConstantData
 	int32_t ViewCountSqrt;
 	int32_t NormalCountSqrt;
 	int32_t RoughnessCount;
-	int32_t SphericalHarmonicCount;
+	int32_t SphericalHarmonicCount; // = SHE_SPEC_COEFFS (fixed 124).
 	float RoughnessStart; // Bake roughness range start.
 	float RoughnessEnd;   // Bake roughness range end.
 	int32_t bRandomRoughness; // 1 = jitter each bake row roughness within its group band.
+	int32_t POrder;            // Active P band count (1..SHE_MAX_P).
+	int32_t QOrder;            // Active Q band count (1..SHE_MAX_Q).
 };
 
 struct SALIGN FSHEReductionConstantData
@@ -90,7 +142,7 @@ struct SALIGN FSHEDiffuseParams
 
 struct SALIGN FSHECoefficientConstantData
 {
-	float4 Coeffs[44]; // [0..32] SHE specular coefficients, [33] auto bias, [34..42] 3-band SH diffuse irradiance, [43] unused.
+	float4 Coeffs[SHE_COEFF_BUFFER_SIZE];
 };
 
 // Classic SH IBL: SH_CLASSIC_COEFF_COUNT RGB radiance projection coefficients

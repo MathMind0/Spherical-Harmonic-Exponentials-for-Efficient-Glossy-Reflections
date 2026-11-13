@@ -5,6 +5,22 @@ float vMF(int l, float k)
     return exp(-float(l * (l+1)) / (2.0f * k));
 }
 
+// vMF band weight exp(-l(l+1) * Roughness / 2). This equals the original
+// vMF(l, 1/Roughness) but avoids the 1/0 division at Roughness == 0 while
+// staying numerically identical for Roughness > 0.
+float SHEVMFWeight(int l, float Roughness)
+{
+    return exp(-0.5f * float(l * (l + 1)) * Roughness);
+}
+
+// Band (SH order l) of flat coefficient index k = l*l + l + m.
+int SHEBandOf(int k)
+{
+    int l = 0;
+    while ((l + 1) * (l + 1) <= k) ++l;
+    return l;
+}
+
 struct FThreeBandSHVector
 {
 	half4 V0;

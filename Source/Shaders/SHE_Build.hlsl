@@ -1,6 +1,7 @@
 #include "../CPUAndGPUCommon.h"
 #include "Common.hlsli"
 #include "SHE_Math.hlsli"
+#include "SHBasis.h"
 
 #define GRootSignature \
     "RootFlags(0), " \
@@ -96,67 +97,44 @@ void MainCS(
     E0 /= NumSamples;
 	E0 = log(max(E0, 1e-6f));
 
-    // calculate A
+    // calculate A: build the SHE feature vector into the fixed spec-coefficient
+    // slots using the shared real-SH basis (up to 10th order). The P section
+    // uses Y_k(R) for k=0..99, the Q section uses Y_k(Hr) for k=1..24 (Q drops
+    // the DC term). Only slots within the selected P/Q orders are active; the
+    // rest are zero, so their solved coefficients stay exactly 0 and the
+    // reduction/solve/calibrate stages can keep a constant dimension.
     const float3 R = reflect(-V, N);
     const float3 Hr = normalize(N + R);
 
-    FFiveBandSHVector yP = SHBasisFunction5(R);
-    FThreeBandSHVector yQ = SHBasisFunction3(Hr);
+    float YR[SH_CLASSIC_COEFF_COUNT];
+    float YH[SH_CLASSIC_COEFF_COUNT];
+    SHBasisEval(R.x, R.y, R.z, YR);
+    SHBasisEval(Hr.x, Hr.y, Hr.z, YH);
 
-    float vmf[5];
-    for(int j = 0; j < 5; j++)
-    {
-        vmf[j] = vMF(j, 1.0f / Roughness);
-    }
-
-    yP = VMF_SH5(yP, vmf);
-    yQ = VMF_SH3(yQ, vmf);
+    const int POrder = GSHEBuildCB.POrder;
+    const int QOrder = GSHEBuildCB.QOrder;
+    const int PActive = POrder * POrder;   // active P coefficients
+    const int QActive = QOrder * QOrder;   // Q k range is 1 .. QActive-1
 
     const int height = NormalIndex + RoughnessIndex * GSHEBuildCB.NormalCount;
     GSHEMatrixb[uint2(ViewIndex, height)] = float4(E0.x, E0.y, E0.z, 1.0f);
 
     ViewIndex *= GSHEBuildCB.SphericalHarmonicCount;
 
-    GSHEMatrixA[uint2(ViewIndex + 0, height)]  = yP.V0.x;
-    GSHEMatrixA[uint2(ViewIndex + 1, height)]  = yP.V0.y;
-    GSHEMatrixA[uint2(ViewIndex + 2, height)]  = yP.V0.z;
-    GSHEMatrixA[uint2(ViewIndex + 3, height)]  = yP.V0.w;
-
-    GSHEMatrixA[uint2(ViewIndex + 4, height)]  = yP.V1.x;
-    GSHEMatrixA[uint2(ViewIndex + 5, height)]  = yP.V1.y;
-    GSHEMatrixA[uint2(ViewIndex + 6, height)]  = yP.V1.z;
-    GSHEMatrixA[uint2(ViewIndex + 7, height)]  = yP.V1.w;
-
-    GSHEMatrixA[uint2(ViewIndex + 8, height)]  = yP.V2.x;
-    GSHEMatrixA[uint2(ViewIndex + 9, height)]  = yP.V2.y;
-    GSHEMatrixA[uint2(ViewIndex + 10, height)] = yP.V2.z;
-    GSHEMatrixA[uint2(ViewIndex + 11, height)] = yP.V2.w;
-
-    GSHEMatrixA[uint2(ViewIndex + 12, height)] = yP.V3.x;
-    GSHEMatrixA[uint2(ViewIndex + 13, height)] = yP.V3.y;
-    GSHEMatrixA[uint2(ViewIndex + 14, height)] = yP.V3.z;
-    GSHEMatrixA[uint2(ViewIndex + 15, height)] = yP.V3.w;
-
-    GSHEMatrixA[uint2(ViewIndex + 16, height)] = yP.V4.x;
-    GSHEMatrixA[uint2(ViewIndex + 17, height)] = yP.V4.y;
-    GSHEMatrixA[uint2(ViewIndex + 18, height)] = yP.V4.z;
-    GSHEMatrixA[uint2(ViewIndex + 19, height)] = yP.V4.w;
-
-    GSHEMatrixA[uint2(ViewIndex + 20, height)] = yP.V5.x;
-    GSHEMatrixA[uint2(ViewIndex + 21, height)] = yP.V5.y;
-    GSHEMatrixA[uint2(ViewIndex + 22, height)] = yP.V5.z;
-    GSHEMatrixA[uint2(ViewIndex + 23, height)] = yP.V5.w;
-
-    GSHEMatrixA[uint2(ViewIndex + 24, height)] = yP.V6;
-
-    GSHEMatrixA[uint2(ViewIndex + 25, height)] = yQ.V0.y;
-    GSHEMatrixA[uint2(ViewIndex + 26, height)] = yQ.V0.z;
-    GSHEMatrixA[uint2(ViewIndex + 27, height)] = yQ.V0.w;
-
-    GSHEMatrixA[uint2(ViewIndex + 28, height)] = yQ.V1.x;
-    GSHEMatrixA[uint2(ViewIndex + 29, height)] = yQ.V1.y;
-    GSHEMatrixA[uint2(ViewIndex + 30, height)] = yQ.V1.z;
-    GSHEMatrixA[uint2(ViewIndex + 31, height)] = yQ.V1.w;
-
-    GSHEMatrixA[uint2(ViewIndex + 32, height)] = yQ.V2;
+    // P section: slots [0 .. SHE_P_COEFFS-1], feature = vMF(band(k)) * Y_k(R).
+    for (int pk = 0; pk < SHE_P_COEFFS; ++pk)
+    {
+        const float w = SHEVMFWeight(SHEBandOf(pk), Roughness);
+        GSHEMatrixA[uint2(ViewIndex + pk, height)] = pk < PActive ? YR[pk] * w : 0.0f;
+    }
+    // Q section: slots [SHE_Q_OFFSET .. SHE_Q_OFFSET+SHE_Q_COEFFS-1]. Slot
+    // (SHE_Q_OFFSET + j) corresponds to flat SH index k = j+1 (DC dropped),
+    // feature = vMF(band(k)) * Y_k(Hr).
+    for (int qj = 0; qj < SHE_Q_COEFFS; ++qj)
+    {
+        const int k = qj + 1;
+        const float w = SHEVMFWeight(SHEBandOf(k), Roughness);
+        const bool bActive = k < QActive;
+        GSHEMatrixA[uint2(ViewIndex + SHE_Q_OFFSET + qj, height)] = bActive ? YH[k] * w : 0.0f;
+    }
 }

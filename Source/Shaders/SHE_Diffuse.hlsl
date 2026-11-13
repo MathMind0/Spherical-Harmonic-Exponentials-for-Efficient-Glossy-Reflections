@@ -13,7 +13,7 @@
 //
 // Stage 2 (SHE_Diffuse_Finalize.hlsl) sums the partials, applies the 4*pi/N
 // normalization and the Ramamoorthi cosine-band convolution, and writes the
-// final coefficients into slots [34..42] of GSHESHCoeff.
+// final coefficients into slots [SHE_DIFFUSE_BASE .. +8] of GSHESHCoeff.
 
 #define GRootSignature \
     "RootFlags(0), " \

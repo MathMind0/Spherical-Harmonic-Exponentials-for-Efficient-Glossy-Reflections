@@ -1,6 +1,12 @@
 #include "../CPUAndGPUCommon.h"
 #include "Common.hlsli"
 
+// SHE specular coefficients live in a FIXED SHE_SPEC_COEFFS-slot layout
+// (P section + Q section). Unused P/Q slots are zero in the A matrix, so the
+// normal equations stay (ridge-)positive-definite and the corresponding
+// solved coefficients come out exactly 0. This keeps the Cholesky dimension a
+// compile-time constant regardless of the UI-selected P/Q orders.
+
 #define GRootSignature \
     "RootFlags(0), " \
     "DescriptorTable(SRV(t0), UAV(u0), visibility = SHADER_VISIBILITY_ALL), " \
@@ -13,12 +19,12 @@ RWStructuredBuffer<float4> GSHEBuffer : register(u0);
 [numthreads(1, 1, 1)]
 void MainCS()
 {
-    float L[33][33];
-    float3 y[33];
-    float3 x[33];
+    float L[SHE_SPEC_COEFFS][SHE_SPEC_COEFFS];
+    float3 y[SHE_SPEC_COEFFS];
+    float3 x[SHE_SPEC_COEFFS];
 
     // Cholesky decomposition
-    for (int i = 0; i < 33; ++i)
+    for (int i = 0; i < SHE_SPEC_COEFFS; ++i)
     {
         for (int j = 0; j <= i; ++j)
         {
@@ -38,32 +44,31 @@ void MainCS()
         }
     }
 
-    // Forward substitution
-    for (int i = 0; i < 33; ++i)
+    // Forward substitution. ATb columns are stored just past the KxK block,
+    // at columns SHE_SPEC_COEFFS .. SHE_SPEC_COEFFS+2 (R, G, B).
+    for (int i = 0; i < SHE_SPEC_COEFFS; ++i)
     {
         float3 Sum = 0;
         for (int j = 0; j < i; ++j)
             Sum += L[i][j] * y[j];
 
         float3 ATb_i = float3(
-            GSHEMatrixAT[uint2(i, 33)].r,
-            GSHEMatrixAT[uint2(i, 34)].r,
-            GSHEMatrixAT[uint2(i, 35)].r
+            GSHEMatrixAT[uint2(i, SHE_SPEC_COEFFS    )].r,
+            GSHEMatrixAT[uint2(i, SHE_SPEC_COEFFS + 1)].r,
+            GSHEMatrixAT[uint2(i, SHE_SPEC_COEFFS + 2)].r
         );
 
         y[i] = (ATb_i - Sum) / max(L[i][i], 1e-8f);
     }
 
     // Backward substitution
-    for (int i = 32; i >= 0; --i)
+    for (int i = SHE_SPEC_COEFFS - 1; i >= 0; --i)
     {
         float3 Sum = 0;
-        for (int j = i + 1; j < 33; ++j)
+        for (int j = i + 1; j < SHE_SPEC_COEFFS; ++j)
             Sum += L[j][i] * x[j];
 
         x[i] = (y[i] - Sum) / max(L[i][i], 1e-8f);
         GSHEBuffer[i] = float4(x[i], 0.0f);
     }
 }
-
-

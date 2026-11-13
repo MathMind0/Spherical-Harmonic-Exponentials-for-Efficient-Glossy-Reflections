@@ -6,7 +6,7 @@
 #define GRootSignature                                                                                                       \
 	"RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT), "                                                                        \
 	"CBV(b0), "                                                                                                              \
-	"DescriptorTable(CBV(b1), CBV(b2), SRV(t0), SRV(t1), SRV(t2), SRV(t3), SRV(t4), SRV(t5), SRV(t6), visibility = SHADER_VISIBILITY_PIXEL), " \
+	"DescriptorTable(CBV(b1), CBV(b2), SRV(t0), SRV(t1), SRV(t2), SRV(t3), SRV(t4), SRV(t5), SRV(t6), SRV(t7), visibility = SHADER_VISIBILITY_PIXEL), " \
 	"StaticSampler("                                                                                                         \
 	"s0, "                                                                                                                   \
 	"filter = FILTER_MIN_MAG_MIP_LINEAR, "                                                                                   \
@@ -25,6 +25,8 @@ Texture2D GBRDFIntegrationMap : register(t3);
 Texture2D GAccumulationBuffer : register(t4);
 StructuredBuffer<float4> GCoeffLUT : register(t5);
 StructuredBuffer<float4> GClassicSHCoeff : register(t6);
+// SG lobes: two float4 per lobe. [2i] = (mu.xyz, lambda), [2i+1] = (a.rgb, 0).
+StructuredBuffer<float4> GSGLobes : register(t7);
 SamplerState GSampler : register(s0);
 
 float3 FresnelSchlick(float CosTheta, float3 F0)
@@ -35,6 +37,32 @@ float3 FresnelSchlick(float CosTheta, float3 F0)
 float3 FresnelSchlickRoughness(float CosTheta, float3 F0, float Roughness)
 {
 	return F0 + (max(1.0f - Roughness, F0) - F0) * pow(1.0f - CosTheta, 5.0f);
+}
+
+// Exact spherical integral of the product of two isotropic Spherical Gaussians:
+//   G(v)  = a   * exp(lambda  * (dot(mu , v) - 1))
+//   K(v)  = aK  * exp(lambdaK * (dot(muK, v) - 1))   (aK is scalar)
+// The product is another SG with
+//   mu'  = (lambda*mu + lambdaK*muK) / lam,  lam = |lambda*mu + lambdaK*muK|,
+//   a'   = a * aK * exp(lam - lambda - lambdaK),
+// and int_{S^2} G'(v) dv = 2*pi*a'*(1 - exp(-2*lam))/lam  (-> 4*pi*a' as lam->0).
+// Used to convolve the fitted environment lobes with a cosine SG (diffuse) or
+// a GGX-as-SG lobe (specular) entirely in closed form.
+float3 SGProductIntegral(float3 mu, float lambda, float3 a,
+						 float3 muK, float lambdaK, float aK)
+{
+	const float d = dot(mu, muK);
+	const float lam = sqrt(lambdaK * lambdaK + lambda * lambda
+						   + 2.0f * lambdaK * lambda * d);
+	// Stable form of (lam - lambda - lambdaK). Direct subtraction loses all
+	// precision when lambdaK is large (mirror-like GGX lobes at low roughness).
+	const float delta = (lambda * lambda + 2.0f * lambdaK * lambda * d)
+						/ (lam + lambdaK) - lambda;
+	const float3 aProd = a * (aK * exp(delta));
+	const float integ = lam > 1e-4f
+		? (2.0f * PI * (1.0f - exp(-2.0f * lam)) / lam)
+		: (4.0f * PI);
+	return aProd * integ;
 }
 
 [RootSignature(GRootSignature)] void MainVS(
@@ -126,6 +154,51 @@ float3 FresnelSchlickRoughness(float CosTheta, float3 F0, float Roughness)
 		float2 EnvBRDF = GBRDFIntegrationMap.SampleLevel(GSampler, float2(min(NoV, 0.999f), min(Roughness, 0.999f)), 0.0f).rg;
 		Specular = PrefilteredColor * (F0 * EnvBRDF.x + EnvBRDF.y);
 	}
+	else if (GPerFrameCB.IBLMode == IBL_MODE_SPHERICAL_GAUSSIAN)
+	{
+		// Spherical Gaussian IBL. The environment radiance is the sum of
+		// isotropic SGs a_i * exp(lambda_i * (dot(mu_i, v) - 1)), fitted on
+		// the CPU. Two zonal SG kernels are convolved with those lobes via the
+		// closed-form SG product integral:
+		//   - cosine SG (mu = N)          -> irradiance E(N) for diffuse,
+		//   - GGX NDF SG (mu = R)         -> prefiltered radiance for specular.
+		const int LobeCount = clamp(GPerFrameCB.SGLobeCount, 1, SG_MAX_LOBES);
+
+		// Cosine-kernel SG: sharpness tuned to the clamped-cosine lobe, with
+		// amplitude calibrated so a constant environment L yields E = PI * L
+		// (exact DC term). Diffuse below divides by PI, matching Split-Sum.
+		const float lambdaCos = 2.0f;
+		const float aCos = lambdaCos / (2.0f * (1.0f - exp(-2.0f * lambdaCos)));
+
+		// GGX NDF as an SG centered on R. alpha = roughness^2, SG sharpness
+		// lambda = 2 / alpha^2. Amplitude normalizes the lobe to integrate to
+		// 1 over the sphere, so the convolution is a weighted radiance average.
+		const float Alpha = max(Roughness * Roughness, 1e-3f);
+		const float lambdaNDF = 2.0f / (Alpha * Alpha);
+		const float aNDF = lambdaNDF / (2.0f * PI * (1.0f - exp(-2.0f * lambdaNDF)));
+
+		float3 Irradiance = 0.0f;
+		float3 PrefilteredColor = 0.0f;
+
+		[loop]
+		for (int i = 0; i < LobeCount; ++i)
+		{
+			const float4 AxisLambda = GSGLobes[2 * i];       // (mu.xyz, lambda)
+			const float4 Amplitude = GSGLobes[2 * i + 1];    // (a.rgb, unused)
+			const float3 muI = AxisLambda.xyz;
+			const float lambdaI = AxisLambda.w;
+			const float3 aI = Amplitude.rgb;
+
+			Irradiance += SGProductIntegral(muI, lambdaI, aI, N, lambdaCos, aCos);
+			PrefilteredColor += SGProductIntegral(muI, lambdaI, aI, R, lambdaNDF, aNDF);
+		}
+
+		Diffuse = max(Irradiance, float3(0.0f, 0.0f, 0.0f)) * (Albedo * (1.0f / PI));
+		PrefilteredColor = max(PrefilteredColor, float3(0.0f, 0.0f, 0.0f));
+
+		float2 EnvBRDF = GBRDFIntegrationMap.SampleLevel(GSampler, float2(min(NoV, 0.999f), min(Roughness, 0.999f)), 0.0f).rg;
+		Specular = PrefilteredColor * (F0 * EnvBRDF.x + EnvBRDF.y);
+	}
 	else if (GPerFrameCB.IBLMode == IBL_MODE_CLASSIC_SH)
 	{
 		// Standard (classic) SH IBL. One set of projected radiance coefficients
@@ -183,23 +256,37 @@ float3 FresnelSchlickRoughness(float CosTheta, float3 F0, float Roughness)
 	}
 	else if (GPerFrameCB.IBLMode == IBL_MODE_SPHERICAL_HARMONICS_EXPONENTIAL)
 	{
-		float3 Hr = normalize(N + R);
+		// SHE specular: log-space radiance = dot(coeffs, features) + autoBias,
+		// where features is the fixed SHE_SPEC_COEFFS-slot basis vector built
+		// from Y_k(R) (P section) and Y_k(Hr) (Q section), each weighted by
+		// the vMF band weight. Only slots within the baked P/Q orders carry
+		// non-zero features; the rest contribute nothing. This mirrors the
+		// feature construction in SHE_Build.hlsl exactly.
+		const float3 Hr = normalize(N + R);
+		float YR[SH_CLASSIC_COEFF_COUNT];
+		float YH[SH_CLASSIC_COEFF_COUNT];
+		SHBasisEval(R.x, R.y, R.z, YR);
+		SHBasisEval(Hr.x, Hr.y, Hr.z, YH);
 
-		FFiveBandSHVector yP = SHBasisFunction5(R);
-		FThreeBandSHVector yQ = SHBasisFunction3(Hr);
+		const int POrder = clamp(GPerFrameCB.SHEPOrder, 1, SHE_MAX_P);
+		const int QOrder = clamp(GPerFrameCB.SHEQOrder, 1, SHE_MAX_Q);
+		const int PActive = POrder * POrder;
+		const int QActive = QOrder * QOrder;
 
-		float vmf[5];
-		for (int l = 0; l < 5; ++l)
+		float3 features[SHE_SPEC_COEFFS];
+		[loop] for (int pk = 0; pk < SHE_P_COEFFS; ++pk)
 		{
-			vmf[l] = vMF(l, 1.0f / Roughness);
+			const float v = pk < PActive ? YR[pk] * SHEVMFWeight(SHEBandOf(pk), Roughness) : 0.0f;
+			features[pk] = float3(v, v, v);
 		}
-		yP = VMF_SH5(yP, vmf);
-		yQ = VMF_SH3(yQ, vmf);
+		[loop] for (int qj = 0; qj < SHE_Q_COEFFS; ++qj)
+		{
+			const int k = qj + 1;
+			const float v = k < QActive ? YH[k] * SHEVMFWeight(SHEBandOf(k), Roughness) : 0.0f;
+			features[SHE_Q_OFFSET + qj] = float3(v, v, v);
+		}
 
-		FFiveBandSHVectorRGB P;
-		FThreeBandSHVectorRGB Q;
-
-		half3 coeffs[33];
+		half3 coeffs[SHE_SPEC_COEFFS];
 		half3 autoBias;
 		if (GPerFrameCB.bUseRoughnessLUT && GPerFrameCB.SHECoeffLUTCount > 0)
 		{
@@ -210,90 +297,56 @@ float3 FresnelSchlickRoughness(float CosTheta, float3 F0, float Roughness)
 			const float F = T - (float)I0;
 			if (GPerFrameCB.bUsePCA && GPerFrameCB.SHEPCABasisCount > 0)
 			{
-				// PCA-compressed LUT (flat float4 stream):
-				//   [0 .. 33]                 : per-parameter mean (rgb)
-				//   [34 + k*34 + i]           : basis vector k, parameter i (rgb)
-				//   [34 + NB*34 + g*NB + k]  : weight of group g on basis k (.x)
-				// Interpolate the low-dimensional weights across roughness, then
-				// reconstruct all 34 params = mean + sum_k w[k]*basis[k].
+				// PCA-compressed LUT (flat float4 stream, stride SHE_LUT_STRIDE):
+				//   [0 .. S-1]                       : per-parameter mean (rgb)
+				//   [S + k*S + i]                   : basis vector k, param i
+				//   [S + NB*S + g*NB + k]          : weight of group g on basis k
 				const int NB = GPerFrameCB.SHEPCABasisCount;
-				const int WeightBase = 34 + NB * 34;
+				const int S = SHE_LUT_STRIDE;
+				const int WeightBase = S + NB * S;
 				float W[16];
-				[loop] for (int k = 0; k < NB; ++k)
+				[loop] for (int kb = 0; kb < NB; ++kb)
 				{
-					W[k] = lerp(GCoeffLUT[WeightBase + I0 * NB + k].x,
-								GCoeffLUT[WeightBase + I1 * NB + k].x, F);
+					W[kb] = lerp(GCoeffLUT[WeightBase + I0 * NB + kb].x,
+								 GCoeffLUT[WeightBase + I1 * NB + kb].x, F);
 				}
-				[unroll] for (int i = 0; i < 34; ++i)
+				[loop] for (int i = 0; i < SHE_LUT_STRIDE; ++i)
 				{
 					float3 val = GCoeffLUT[i].rgb; // mean
-					[loop] for (int k = 0; k < NB; ++k)
+					[loop] for (int kb = 0; kb < NB; ++kb)
 					{
-						val += W[k] * GCoeffLUT[34 + k * 34 + i].rgb;
+						val += W[kb] * GCoeffLUT[S + kb * S + i].rgb;
 					}
-					if (i < 33) coeffs[i] = (half3)val;
-					else        autoBias = (half3)val;
+					if (i < SHE_SPEC_COEFFS) coeffs[i] = (half3)val;
+					else                     autoBias = (half3)val;
 				}
 			}
 			else
 			{
-				const int Base0 = I0 * 34;
-				const int Base1 = I1 * 34;
-				[unroll] for (int i = 0; i < 33; ++i)
+				const int Base0 = I0 * SHE_LUT_STRIDE;
+				const int Base1 = I1 * SHE_LUT_STRIDE;
+				[loop] for (int i = 0; i < SHE_SPEC_COEFFS; ++i)
 				{
 					coeffs[i] = lerp(GCoeffLUT[Base0 + i].rgb, GCoeffLUT[Base1 + i].rgb, F);
 				}
-				autoBias = lerp(GCoeffLUT[Base0 + 33].rgb, GCoeffLUT[Base1 + 33].rgb, F);
+				autoBias = lerp(GCoeffLUT[Base0 + SHE_AUTOBIAS_SLOT].rgb, GCoeffLUT[Base1 + SHE_AUTOBIAS_SLOT].rgb, F);
 			}
 		}
 		else
 		{
-			[unroll] for (int i = 0; i < 33; ++i)
+			[loop] for (int i = 0; i < SHE_SPEC_COEFFS; ++i)
 			{
 				coeffs[i] = GSHECoeffCB.Coeffs[i].rgb;
 			}
-			autoBias = GSHECoeffCB.Coeffs[33].rgb;
+			autoBias = GSHECoeffCB.Coeffs[SHE_AUTOBIAS_SLOT].rgb;
 		}
 
-		P.R.V0 = half4(coeffs[0].r, coeffs[1].r, coeffs[2].r, coeffs[3].r);
-		P.R.V1 = half4(coeffs[4].r, coeffs[5].r, coeffs[6].r, coeffs[7].r);
-		P.R.V2 = half4(coeffs[8].r, coeffs[9].r, coeffs[10].r, coeffs[11].r);
-		P.R.V3 = half4(coeffs[12].r, coeffs[13].r, coeffs[14].r, coeffs[15].r);
-		P.R.V4 = half4(coeffs[16].r, coeffs[17].r, coeffs[18].r, coeffs[19].r);
-		P.R.V5 = half4(coeffs[20].r, coeffs[21].r, coeffs[22].r, coeffs[23].r);
-		P.R.V6 = half(coeffs[24].r);
-
-		P.G.V0 = half4(coeffs[0].g, coeffs[1].g, coeffs[2].g, coeffs[3].g);
-		P.G.V1 = half4(coeffs[4].g, coeffs[5].g, coeffs[6].g, coeffs[7].g);
-		P.G.V2 = half4(coeffs[8].g, coeffs[9].g, coeffs[10].g, coeffs[11].g);
-		P.G.V3 = half4(coeffs[12].g, coeffs[13].g, coeffs[14].g, coeffs[15].g);
-		P.G.V4 = half4(coeffs[16].g, coeffs[17].g, coeffs[18].g, coeffs[19].g);
-		P.G.V5 = half4(coeffs[20].g, coeffs[21].g, coeffs[22].g, coeffs[23].g);
-		P.G.V6 = half(coeffs[24].g);
-
-		P.B.V0 = half4(coeffs[0].b, coeffs[1].b, coeffs[2].b, coeffs[3].b);
-		P.B.V1 = half4(coeffs[4].b, coeffs[5].b, coeffs[6].b, coeffs[7].b);
-		P.B.V2 = half4(coeffs[8].b, coeffs[9].b, coeffs[10].b, coeffs[11].b);
-		P.B.V3 = half4(coeffs[12].b, coeffs[13].b, coeffs[14].b, coeffs[15].b);
-		P.B.V4 = half4(coeffs[16].b, coeffs[17].b, coeffs[18].b, coeffs[19].b);
-		P.B.V5 = half4(coeffs[20].b, coeffs[21].b, coeffs[22].b, coeffs[23].b);
-		P.B.V6 = half(coeffs[24].b);
-
-		Q.R.V0 = half4(0.0h, coeffs[25].r, coeffs[26].r, coeffs[27].r);
-		Q.R.V1 = half4(coeffs[28].r, coeffs[29].r, coeffs[30].r, coeffs[31].r);
-		Q.R.V2 = half(coeffs[32].r);
-
-		Q.G.V0 = half4(0.0h, coeffs[25].g, coeffs[26].g, coeffs[27].g);
-		Q.G.V1 = half4(coeffs[28].g, coeffs[29].g, coeffs[30].g, coeffs[31].g);
-		Q.G.V2 = half(coeffs[32].g);
-
-		Q.B.V0 = half4(0.0h, coeffs[25].b, coeffs[26].b, coeffs[27].b);
-		Q.B.V1 = half4(coeffs[28].b, coeffs[29].b, coeffs[30].b, coeffs[31].b);
-		Q.B.V2 = half(coeffs[32].b);
-
-		half3 logP = DotSH5(P, yP);
-		half3 logQ = DotSH3(Q, yQ);
-		half3 E0 = exp(logP + logQ + autoBias);
+		half3 logSpec = autoBias;
+		[loop] for (int i = 0; i < SHE_SPEC_COEFFS; ++i)
+		{
+			logSpec += coeffs[i] * features[i];
+		}
+		half3 E0 = exp(logSpec);
 
 		half3 E1 = E0 * GBRDFIntegrationMap.SampleLevel(GSampler, float2(min(NoV, 0.999f), min(Roughness, 0.999f)), 0.0f).g;
 		Specular = F0 * E0 + (1.0f - F0) * E1;
@@ -304,15 +357,15 @@ float3 FresnelSchlickRoughness(float CosTheta, float3 F0, float Roughness)
 		FThreeBandSHVector yN = SHBasisFunction3(half3(N));
 		FThreeBandSHVectorRGB DiffuseSH;
 		{
-			half3 d0 = GSHECoeffCB.Coeffs[34].rgb;
-			half3 d1 = GSHECoeffCB.Coeffs[35].rgb;
-			half3 d2 = GSHECoeffCB.Coeffs[36].rgb;
-			half3 d3 = GSHECoeffCB.Coeffs[37].rgb;
-			half3 d4 = GSHECoeffCB.Coeffs[38].rgb;
-			half3 d5 = GSHECoeffCB.Coeffs[39].rgb;
-			half3 d6 = GSHECoeffCB.Coeffs[40].rgb;
-			half3 d7 = GSHECoeffCB.Coeffs[41].rgb;
-			half3 d8 = GSHECoeffCB.Coeffs[42].rgb;
+			half3 d0 = GSHECoeffCB.Coeffs[SHE_DIFFUSE_BASE + 0].rgb;
+			half3 d1 = GSHECoeffCB.Coeffs[SHE_DIFFUSE_BASE + 1].rgb;
+			half3 d2 = GSHECoeffCB.Coeffs[SHE_DIFFUSE_BASE + 2].rgb;
+			half3 d3 = GSHECoeffCB.Coeffs[SHE_DIFFUSE_BASE + 3].rgb;
+			half3 d4 = GSHECoeffCB.Coeffs[SHE_DIFFUSE_BASE + 4].rgb;
+			half3 d5 = GSHECoeffCB.Coeffs[SHE_DIFFUSE_BASE + 5].rgb;
+			half3 d6 = GSHECoeffCB.Coeffs[SHE_DIFFUSE_BASE + 6].rgb;
+			half3 d7 = GSHECoeffCB.Coeffs[SHE_DIFFUSE_BASE + 7].rgb;
+			half3 d8 = GSHECoeffCB.Coeffs[SHE_DIFFUSE_BASE + 8].rgb;
 
 			DiffuseSH.R.V0 = half4(d0.r, d1.r, d2.r, d3.r);
 			DiffuseSH.R.V1 = half4(d4.r, d5.r, d6.r, d7.r);

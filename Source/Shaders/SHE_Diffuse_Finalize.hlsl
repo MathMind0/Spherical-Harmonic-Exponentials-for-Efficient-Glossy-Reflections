@@ -8,15 +8,16 @@
 // accumulates them locally, and the group is reduced with WaveActiveSum.
 // Lane 0 applies the 4*pi/N Monte Carlo normalization, multiplies in the
 // Ramamoorthi clamped-cosine band convolution coefficients A_l
-// {pi, 2pi/3, pi/4}, and writes the final coefficients into slots [34..42]
-// of GSHESHCoeff. Slot [43] is zeroed as unused.
+// {pi, 2pi/3, pi/4}, and writes the final coefficients into slots
+// [SHE_DIFFUSE_BASE .. SHE_DIFFUSE_BASE+8].
 //
 // Result layout in GSHESHCoeff (float4 each):
-//   [34 .. 42] : RGB diffuse irradiance SH coefficients, w unused
-//   [43]       : unused (zeroed)
+//   [SHE_DIFFUSE_BASE .. +8] : RGB diffuse irradiance SH coefficients (w unused)
+//   [SHE_DIFFUSE_BASE + 9]   : unused (zeroed)
 //
-// Slots [0..32] hold the SHE specular coefficients and [33] the auto bias;
-// they are written by SHE_Solve/SHE_Calibrate and must not be touched here.
+// Slots [0..SHE_SPEC_COEFFS-1] hold the SHE specular coefficients and
+// [SHE_AUTOBIAS_SLOT] the auto bias; they are written by SHE_Solve /
+// SHE_Calibrate and must not be touched here.
 
 #define GRootSignature \
     "RootFlags(0), " \
@@ -80,10 +81,12 @@ void MainCS(uint LaneIndex : SV_GroupThreadID)
             // reconstruction sum_j (A_lj * c_j) * y_j(N) yields irradiance E(N).
             float3 IrradianceCoeff = c * IrradianceBandA[BandIndex[CoeffOut]];
 
-            // Slots [34..42] follow the 33 SHE specular coefficients + 1 auto bias.
-            GSHESHCoeff[34 + CoeffOut] = float4(IrradianceCoeff, 0.0f);
+            // Slots [SHE_DIFFUSE_BASE .. +9] follow the specular coefficients
+            // and the auto bias slot; the earlier slots are written by
+            // SHE_Solve / SHE_Calibrate and must not be touched here.
+            GSHESHCoeff[SHE_DIFFUSE_BASE + CoeffOut] = float4(IrradianceCoeff, 0.0f);
         }
 
-        GSHESHCoeff[43] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        GSHESHCoeff[SHE_DIFFUSE_BASE + SHE_DIFFUSE_COEFFS] = float4(0.0f, 0.0f, 0.0f, 0.0f);
     }
 }

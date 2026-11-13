@@ -15,37 +15,67 @@
 
 #define MESH_MAX_NUM_SECTIONS 4
 
-// SHE build grid: 8x8 view directions, 8x8 normals, 33 SH coefficients,
-// and 64 NormalCount rows per roughness slice.
+// SHE build grid: 8x8 view directions, 8x8 normals, fixed spec-coefficient
+// slots (SHE_SPEC_COEFFS), and 64 NormalCount rows per roughness slice.
 static const uint32_t GSHEViewCountSqrt = 8;
 static const uint32_t GSHENormalCountSqrt = 8;
 static const uint32_t GSHEViewCount = GSHEViewCountSqrt * GSHEViewCountSqrt;
 static const uint32_t GSHENormalCount = GSHENormalCountSqrt * GSHENormalCountSqrt;
-static const uint32_t GSHESphericalHarmonicCount = 33;
+static const uint32_t GSHESphericalHarmonicCount = SHE_SPEC_COEFFS; // fixed 124-slot layout.
 static const uint32_t GSHECoeffLUTMaxGroups = 16; // Matches the UI max bake levels.
-static const uint32_t GSHECoeffPerGroup = 34;     // 33 specular + 1 autoBias float4.
+static const uint32_t GSHECoeffPerGroup = SHE_LUT_STRIDE; // specular + autoBias.
 static const uint32_t GSHECoeffLUTMaxBasis = 16;   // Max PCA basis vectors (N).
-static const uint32_t GSHECoeffLUTMaxFloat4 = 1024; // LUT buffer capacity (mean+basis+weights).
+static const uint32_t GSHECoeffLUTMaxFloat4 = 4096; // LUT capacity: raw G*S or PCA S + N*S + G*N.
+static const int GSHEPCADimMax = SHE_LUT_STRIDE * 3; // PCA sample dimension (3 RGB per slot).
 
-// The 33 specular coefficients grouped by SH band (order l).
-// Standard SH: order l has (2*l + 1) coefficients, i.e. 1 / 3 / 5 / 7 / 9 ...
-// P is a 5-band SH (indices 0..24): l=0..4 -> 1, 3, 5, 7, 9.
-// Q is a 3-band SH with its DC dropped (indices 25..32): l=1, 2 -> 3, 5.
-// P and Q are kept as separate bands (both l=1 / l=2 appear) so every band
-// column holds exactly its (2*l + 1) parameters and all 33 are covered.
-static const int GCoeffBandCount = 7;
+// The SHE specular coefficients grouped by SH band (order l). The P section
+// covers l = 0..9 (1/3/5/7/9/11/13/15/17/19 coefficients), the Q section
+// covers l = 1..4 (3/5/7/9 coefficients, DC dropped). Each band column lists
+// the flat coefficient indices that belong to it (P bands use their natural
+// k = l*l..l*l+2l, Q bands live at SHE_Q_OFFSET + (k-1)).
+static const int GCoeffBandCount = (SHE_MAX_P + SHE_MAX_Q - 1);
+static const int GCoeffBandMaxMembers = (2 * SHE_MAX_P - 1); // widest band (2l+1).
+
 static const char *GCoeffBandLabels[GCoeffBandCount] = {
-	"P l=0", "P l=1", "P l=2", "P l=3", "P l=4", "Q l=1", "Q l=2"};
-static const int GCoeffBandCoeffCount[GCoeffBandCount] = {1, 3, 5, 7, 9, 3, 5};
-static const int GCoeffBandIndices[GCoeffBandCount][9] = {
-	{0,  -1, -1, -1, -1, -1, -1, -1, -1}, // P l=0  (1)
-	{1,  2,  3,  -1, -1, -1, -1, -1, -1}, // P l=1  (3)
-	{4,  5,  6,  7,  8,  -1, -1, -1, -1}, // P l=2  (5)
-	{9,  10, 11, 12, 13, 14, 15, -1, -1}, // P l=3  (7)
-	{16, 17, 18, 19, 20, 21, 22, 23, 24}, // P l=4  (9)
-	{25, 26, 27, -1, -1, -1, -1, -1, -1}, // Q l=1  (3)
-	{28, 29, 30, 31, 32, -1, -1, -1, -1}, // Q l=2  (5)
+	"P l=0", "P l=1", "P l=2", "P l=3", "P l=4", "P l=5", "P l=6", "P l=7", "P l=8", "P l=9",
+	"Q l=1", "Q l=2", "Q l=3", "Q l=4"
 };
+static const int GCoeffBandCoeffCount[GCoeffBandCount] = {
+	1, 3, 5, 7, 9, 11, 13, 15, 17, 19,
+	3, 5, 7, 9
+};
+// BandIsP[b] and BandL[b] describe each band; indices are derived on the fly
+// (see SHEBandIndicesFill) so the table works for any P/Q layout.
+static const int GCoeffBandIsP[GCoeffBandCount] = {
+	1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+	0, 0, 0, 0
+};
+static const int GCoeffBandL[GCoeffBandCount] = {
+	0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+	1, 2, 3, 4
+};
+
+// Fill the flat coefficient indices for band b into Out[0..count-1].
+static int SHEBandIndicesFill(int b, int *Out)
+{
+	const bool bIsP = GCoeffBandIsP[b] != 0;
+	const int l = GCoeffBandL[b];
+	const int count = 2 * l + 1;
+	for (int m = 0; m < count; ++m)
+	{
+		const int k = l * l + m; // flat SH index for this (l, m)
+		if (bIsP)
+		{
+			Out[m] = k; // P section slot == flat k
+		}
+		else
+		{
+			// Q section stores flat k starting from k=1 at SHE_Q_OFFSET.
+			Out[m] = SHE_Q_OFFSET + (k - 1);
+		}
+	}
+	return count;
+}
 
 // CPU-side copy of the grouped-fit coefficients, used by both the render path
 // (uploaded into the LUT buffer) and the ImGui variance table.
@@ -53,15 +83,17 @@ struct FSHECoeffTable
 {
 	int Valid = 0;                      // 1 when the table has been computed at least once.
 	int BakeRoughnessCount = 0;         // Number of roughness groups baked when this table was built.
+	int POrder = SHE_MAX_P;             // P band count used for this fit.
+	int QOrder = SHE_MAX_Q;             // Q band count used for this fit.
 	float RoughnessStart = 0.0f;        // Roughness of group 0.
 	float RoughnessEnd = 1.0f;          // Roughness of the last group.
 	// Index 0..N-1: per-roughness grouped fit. Index N: ungrouped (global) fit.
-	// Each Coeff[group] holds 34 float4 (33 specular + autoBias), only .xyz used.
+	// Each Coeff[group] holds SHE_LUT_STRIDE float4 (specular + autoBias), only .xyz used.
 	float Coeff[GSHECoeffLUTMaxGroups + 1][GSHECoeffPerGroup][4];
 	// Squared deviation of each grouped fit's channel value from the ungrouped
 	// baseline, accumulated per band and in total. Computed for the UI table.
 	float BandVariance[GSHECoeffLUTMaxGroups][GCoeffBandCount]; // [group][band]; variance vs ungrouped baseline.
-	float TotalVariance[GSHECoeffLUTMaxGroups];    // [group]; variance over all 33 coefficients.
+	float TotalVariance[GSHECoeffLUTMaxGroups];    // [group]; variance over all specular coefficients.
 	// PCA data (filled by UploadCoeffLUT when PCA is active), for the ImGui table:
 	int PCABasisCount = 0;                          // number of active basis vectors (N).
 	float PCABasisCoeff[GSHECoeffLUTMaxBasis][GSHECoeffPerGroup][4]; // [k][i][c] basis k value of parameter i.
@@ -108,12 +140,13 @@ static float HalfToFloat(uint16_t H)
 	return Result;
 }
 
-// Solve (A^T A + ridge*I) x = A^T b for a 33x33 symmetric positive system,
+// Solve (A^T A + ridge*I) x = A^T b for a KxK symmetric positive system,
 // for three right-hand sides (RGB). AtA is shared across channels; Atb has 3.
-static void SolveGroupedFit(const float AtA[33][33], const float Atb[33][3], float OutX[33][3])
+// K = SHE_SPEC_COEFFS is the fixed slot count; only the first N slots are
+// active for the current P/Q orders (unused slots solve to exactly 0).
+static void SolveGroupedFit(const float AtA[SHE_SPEC_COEFFS][SHE_SPEC_COEFFS], const float Atb[SHE_SPEC_COEFFS][3], float OutX[SHE_SPEC_COEFFS][3], int N)
 {
-	const int N = 33;
-	float L[33][33] = {};
+	float L[SHE_SPEC_COEFFS][SHE_SPEC_COEFFS] = {};
 	for (int i = 0; i < N; ++i)
 	{
 		for (int j = 0; j <= i; ++j)
@@ -137,7 +170,7 @@ static void SolveGroupedFit(const float AtA[33][33], const float Atb[33][3], flo
 	}
 	for (int Ch = 0; Ch < 3; ++Ch)
 	{
-		float Y[33];
+		float Y[SHE_SPEC_COEFFS];
 		for (int i = 0; i < N; ++i)
 		{
 			float Sum = Atb[i][Ch];
@@ -228,18 +261,19 @@ struct FStaticMesh
 
 // Vertical order of the IBL groups in the sphere grid. Row 0 is drawn at the
 // BOTTOM of the screen (local +Y points up), so GIBLModeGroupOrder[0] is the
-// bottom group and [3] is the top group. 4 groups x 2 metallic rows = 8 rows.
-// Classic SH sits in the bottom two rows, directly below the SHE rows, for a
-// side-by-side comparison of the traditional SH path against SHE.
-// Screen top-to-bottom: Split-Sum / Reference / SHE / Classic SH.
-static const int GIBLModeGroupOrder[4] =
+// bottom group and the last entry is the top group. 5 groups x 2 metallic
+// rows = 10 rows.
+// Screen top-to-bottom: SG / Split-Sum / Reference / SHE / Classic SH.
+// Classic SH stays in the bottom two rows, directly below the SHE rows.
+static const int GIBLModeGroupOrder[5] =
 {
 	IBL_MODE_CLASSIC_SH,
 	IBL_MODE_SPHERICAL_HARMONICS_EXPONENTIAL,
 	IBL_MODE_REFERENCE,
 	IBL_MODE_SPLIT_SUM_APPROXIMATION,
+	IBL_MODE_SPHERICAL_GAUSSIAN,
 };
-static const int GIBLModeGroupCount = 4;
+static const int GIBLModeGroupCount = 5;
 
 // Mouse orbit camera control parameters.
 static const float GCameraRotateSpeed = 0.005f;	   // Radians per pixel of mouse drag.
@@ -291,13 +325,19 @@ struct FDemoRoot
 	ID3D12Resource *SHEMatrixb;
 	ID3D12Resource *SHEMatrixAT;
 	ID3D12Resource *SHESHCoeff;
-	ID3D12Resource *SHECoeffLUT;               // StructuredBuffer<float4>, flat [group*34 + i].
+	ID3D12Resource *SHECoeffLUT;               // StructuredBuffer<float4>, flat [group*SHE_LUT_STRIDE + i].
 	D3D12_CPU_DESCRIPTOR_HANDLE SHECoeffLUTSRV; // SRV bound at t5 in the SimpleForward descriptor table.
 	void *SHECoeffLUTMapped = nullptr;          // Persistently mapped CPU write pointer (upload heap).
 	ID3D12Resource *ClassicSHCoeff = nullptr;       // Upload buffer: StructuredBuffer<float4> of SH projection coefficients.
 	D3D12_CPU_DESCRIPTOR_HANDLE ClassicSHCoeffSRV;  // SRV bound at t6 in the SimpleForward descriptor table.
 	void *ClassicSHCoeffMapped = nullptr;           // Persistently mapped CPU write pointer.
 	int ClassicSHOrder = 3;                         // Classic SH band count (order 2..10), default 3-band.
+	ID3D12Resource *SGLobes = nullptr;              // Upload buffer: StructuredBuffer<float4>, 2 float4 per lobe (axis+lambda, amplitude).
+	D3D12_CPU_DESCRIPTOR_HANDLE SGLobesSRV;         // SRV bound at t7 in the SimpleForward descriptor table.
+	void *SGLobesMapped = nullptr;                  // Persistently mapped CPU write pointer.
+	int SGLobeCount = 6;                            // SG IBL lobe count (1..SG_MAX_LOBES).
+	int SGAxisMode = SG_FIT_FIXED_AXIS;             // SG_FIT_FIXED_AXIS / SG_FIT_FREE_AXIS.
+	int SGDirty = 1;                                // 1 = re-run the CPU SG fit with the current settings.
 	D3D12_CPU_DESCRIPTOR_HANDLE EnvMapSRV;
 	D3D12_CPU_DESCRIPTOR_HANDLE IrradianceMapSRV;
 	D3D12_CPU_DESCRIPTOR_HANDLE PrefilteredEnvMapSRV;
@@ -323,6 +363,8 @@ struct FDemoRoot
 	float BakeRoughnessStart = 0.0f; // SHE bake roughness range start.
 	float BakeRoughnessEnd = 1.0f; // SHE bake roughness range end.
 	int BakeRoughnessCount = 4; // SHE bake roughness levels.
+	int SHEPOrder = 5;          // SHE P (R-direction) SH band count, 1..SHE_MAX_P.
+	int SHEQOrder = 3;          // SHE Q (Hr-direction) SH band count, 1..SHE_MAX_Q.
 	int PendingSHEBake = 0; // 1 = re-run the SHE precomputation with the current bake parameters.
 	bool bUseRoughnessLUT = false;  // ImGui toggle: render SHE with per-roughness grouped-fit coefficients.
 	bool bUsePCA = false;           // ImGui toggle: PCA-compress the Roughness LUT and reconstruct at runtime.
@@ -343,6 +385,8 @@ static void RebuildSHEBake(FDemoRoot &Root);
 static void ComputeGroupedSHEFit(FDemoRoot &Root);
 static void UploadCoeffLUT(FDemoRoot &Root);
 static void DrawSHECoeffTable(FDemoRoot &Root);
+static void CreateSGLobeResources(FDemoRoot &Root);
+static void FitEnvMapToSG(FDemoRoot &Root);
 
 static void UpdateUI(FDemoRoot &Root, float DeltaTime)
 {
@@ -369,7 +413,26 @@ static void UpdateUI(FDemoRoot &Root, float DeltaTime)
 
 	{
 		ImGui::Text("IBL Mode");
-		ImGui::TextDisabled("Top: Split-Sum / Ref / SHE / Classic SH :Bottom");
+		ImGui::TextDisabled("Top: SG / Split-Sum / Ref / SHE / Classic SH :Bottom");
+	}
+
+	{
+		ImGui::Text("SG Lobe Count");
+		ImGui::TextDisabled("Spherical Gaussians used to fit the environment");
+		if (ImGui::SliderInt("##SGLobeCount", &Root.SGLobeCount, 1, SG_MAX_LOBES, "Lobes %d"))
+		{
+			Root.SGDirty = 1;
+			Root.NumFrames = 0;
+		}
+		const char *FitModes[] = {"Axis Fixed (uniform)", "Axis Free (fitted)"};
+		ImGui::Text("SG Fitting");
+		if (ImGui::Combo("##SGAxisMode", &Root.SGAxisMode, FitModes, IM_ARRAYSIZE(FitModes)))
+		{
+			Root.SGAxisMode = XMMin(XMMax(Root.SGAxisMode, SG_FIT_FIXED_AXIS), SG_FIT_FREE_AXIS);
+			Root.SGDirty = 1;
+			Root.NumFrames = 0;
+		}
+		ImGui::TextDisabled("Fixed: axes on a uniform Fibonacci sphere; Free: axes move to fit");
 	}
 
 	{
@@ -403,6 +466,23 @@ static void UpdateUI(FDemoRoot &Root, float DeltaTime)
 			}
 			Root.NumFrames = 0;
 		}
+	}
+
+	{
+		// SHE P/Q SH orders. P is the R-direction basis order (1..10), Q the
+		// Hr-direction order (1..5). Changing either changes the baked feature
+		// layout, so it must trigger a full SHE rebake (not just a LUT repack).
+		ImGui::Text("SHE P / Q Orders");
+		ImGui::TextDisabled("P: R-direction SH order  Q: Hr-direction SH order");
+		if (ImGui::SliderInt("##SHEPOrder", &Root.SHEPOrder, 1, SHE_MAX_P, "P = %d"))
+		{
+			Root.PendingSHEBake = 1;
+		}
+		if (ImGui::SliderInt("##SHEQOrder", &Root.SHEQOrder, 1, SHE_MAX_Q, "Q = %d"))
+		{
+			Root.PendingSHEBake = 1;
+		}
+		ImGui::TextDisabled("Default P=5 Q=3 reproduces the original SH5 / SH3 SHE");
 	}
 
 	{
@@ -507,6 +587,14 @@ static void Update(FDemoRoot &Root)
 	}
 	Root.PCALUTDirty = 0;
 
+	// Re-fit the SG representation when the lobe count or axis mode changed.
+	// This is a pure CPU-side fit of the current HDR; no GPU rebake needed.
+	if (Root.SGDirty)
+	{
+		Root.SGDirty = 0;
+		FitEnvMapToSG(Root);
+	}
+
 	if (Root.PendingEnvironmentMapIndex >= 0)
 	{
 		// The environment rebuild already re-runs the SHE bake with the
@@ -583,14 +671,14 @@ static void Draw(FDemoRoot &Root)
 
 	const XMMATRIX ViewTransform = XMMatrixLookAtLH(XMLoadFloat3(&Root.CameraPosition), XMLoadFloat3(&Root.CameraFocusPosition), XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f));
 
-	// Projection: orthographic fits the 11x8 sphere grid with margin (grid spans
-	// 24.2 x 17.6 units). Perspective uses the orbit distance to frame the grid.
+	// Projection: orthographic fits the 11x10 sphere grid with margin (grid spans
+	// 24.2 x 22 units). Perspective uses the orbit distance to frame the grid.
 	XMMATRIX ProjectionTransform;
 	if (Root.bOrthographicProjection)
 	{
 		const float AspectRatio = (float)Gfx.Resolution[0] / (float)Gfx.Resolution[1];
 		const float GridWidth = 11 * 2.2f;
-		const float GridHeight = 8 * 2.2f;
+		const float GridHeight = 10 * 2.2f;
 		float ViewWidth = GridWidth + 4.0f;
 		float ViewHeight = ViewWidth / AspectRatio;
 		if (ViewHeight < GridHeight + 2.0f)
@@ -608,7 +696,7 @@ static void Draw(FDemoRoot &Root)
 		// (with the same margin) fills the viewport similarly to the ortho view.
 		const float AspectRatio = (float)Gfx.Resolution[0] / (float)Gfx.Resolution[1];
 		const float GridWidth = 11 * 2.2f;
-		const float GridHeight = 8 * 2.2f;
+		const float GridHeight = 10 * 2.2f;
 		float ViewWidth = GridWidth + 4.0f;
 		float ViewHeight = ViewWidth / AspectRatio;
 		if (ViewHeight < GridHeight + 2.0f)
@@ -685,7 +773,7 @@ static void Draw(FDemoRoot &Root)
 			ImDrawList *LabelDrawList = ImGui::GetBackgroundDrawList();
 			const ImGuiIO &LabelIO = ImGui::GetIO();
 
-			const int32_t NumRows = 8;
+			const int32_t NumRows = 10;
 			const int32_t NumColumns = 11;
 			const float CellSize = 2.2f;
 			// Anchor slightly above the top row of spheres.
@@ -768,10 +856,14 @@ static void Draw(FDemoRoot &Root)
 			CPUAddress->bUsePCA = (Root.bUsePCA && Root.CoeffTable.Valid) ? 1 : 0;
 			CPUAddress->SHEPCABasisCount = (Root.bUsePCA && Root.CoeffTable.Valid) ? Root.ActivePCABasisCount : 0;
 			CPUAddress->ClassicSHOrder = Root.ClassicSHOrder;
+			CPUAddress->SGLobeCount = Root.SGLobeCount;
+			CPUAddress->SGAxisMode = Root.SGAxisMode;
+			CPUAddress->SHEPOrder = Root.CoeffTable.Valid ? Root.CoeffTable.POrder : Root.SHEPOrder;
+			CPUAddress->SHEQOrder = Root.CoeffTable.Valid ? Root.CoeffTable.QOrder : Root.SHEQOrder;
 
 			CD3DX12_CPU_DESCRIPTOR_HANDLE TableBaseCPU;
 			CD3DX12_GPU_DESCRIPTOR_HANDLE TableBaseGPU;
-			AllocateGPUDescriptors(Gfx, 9, TableBaseCPU, TableBaseGPU);
+			AllocateGPUDescriptors(Gfx, 10, TableBaseCPU, TableBaseGPU);
 
 			D3D12_CONSTANT_BUFFER_VIEW_DESC CBVDesc = {};
 			CBVDesc.BufferLocation = GPUAddress;
@@ -802,6 +894,9 @@ static void Draw(FDemoRoot &Root)
 			TableBaseCPU.Offset(Gfx.DescriptorSize);
 
 			Gfx.Device->CopyDescriptorsSimple(1, TableBaseCPU, Root.ClassicSHCoeffSRV, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+			TableBaseCPU.Offset(Gfx.DescriptorSize);
+
+			Gfx.Device->CopyDescriptorsSimple(1, TableBaseCPU, Root.SGLobesSRV, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 			TableBaseCPU.Offset(Gfx.DescriptorSize);
 
 			CmdList->SetGraphicsRootDescriptorTable(1, TableBaseGPU);
@@ -1433,7 +1528,7 @@ static void SHEBuild(const FDemoRoot &Root, FGraphicsContext &Gfx, ID3D12Resourc
 	const uint32_t ViewCount = ViewCountSqrt * ViewCountSqrt;
 	const uint32_t NormalCount = NormalCountSqrt * NormalCountSqrt;
 	const uint32_t RoughnessCount = (uint32_t)Root.BakeRoughnessCount;
-	const uint32_t SphericalHarmonicCount = 33; // 25(SH5) + 9(SH3) - 1(DC)
+	const uint32_t SphericalHarmonicCount = SHE_SPEC_COEFFS; // fixed 124-slot P/Q layout.
 
 	const D3D12_CPU_DESCRIPTOR_HANDLE TempSHEMatrixAUAV = AllocateDescriptors(Gfx, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
 	{
@@ -1469,6 +1564,8 @@ static void SHEBuild(const FDemoRoot &Root, FGraphicsContext &Gfx, ID3D12Resourc
 	CPUAddress->RoughnessStart = Root.BakeRoughnessStart;
 	CPUAddress->RoughnessEnd = Root.BakeRoughnessEnd;
 	CPUAddress->bRandomRoughness = Root.bRandomRoughness ? 1 : 0;
+	CPUAddress->POrder = Root.SHEPOrder;
+	CPUAddress->QOrder = Root.SHEQOrder;
 
 	CD3DX12_CPU_DESCRIPTOR_HANDLE TableBaseCPU;
 	CD3DX12_GPU_DESCRIPTOR_HANDLE TableBaseGPU;
@@ -1510,7 +1607,7 @@ static void SHEReduction(FDemoRoot &Root, FGraphicsContext &Gfx, ID3D12Resource 
 	const uint32_t ViewCount = ViewCountSqrt * ViewCountSqrt;
 	const uint32_t NormalCount = NormalCountSqrt * NormalCountSqrt;
 	const uint32_t RoughnessCount = (uint32_t)Root.BakeRoughnessCount;
-	const uint32_t SphericalHarmonicCount = 33; // 25(SH5) + 9(SH3) - 1(DC)
+	const uint32_t SphericalHarmonicCount = SHE_SPEC_COEFFS; // fixed 124-slot P/Q layout.
 	const uint32_t GroupCountZ = 64;
 
 	ID3D12Resource *TempSHEMatrixAT3D;
@@ -1631,7 +1728,7 @@ static void SHESolve(FGraphicsContext &Gfx, ID3D12Resource *&OutSHESHCoeff, D3D1
 		VHR(Gfx.Device->CreateCommittedResource(get_rvalue_ptr(CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT)), D3D12_HEAP_FLAG_NONE, &Desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&OutSHESHCoeff)));
 		D3D12_UNORDERED_ACCESS_VIEW_DESC UAVDesc = {};
 		UAVDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-		UAVDesc.Buffer.NumElements = 34;
+		UAVDesc.Buffer.NumElements = SHE_LUT_STRIDE;
 		UAVDesc.Buffer.StructureByteStride = sizeof(XMFLOAT4);
 		UAVDesc.Format = DXGI_FORMAT_UNKNOWN;
 		Gfx.Device->CreateUnorderedAccessView(OutSHESHCoeff, nullptr, &UAVDesc, TempSHESHCoeffUAV);
@@ -1666,13 +1763,13 @@ static void SHECalibrate(const FDemoRoot &Root, FGraphicsContext &Gfx, ID3D12Res
 	const uint32_t ViewCount = ViewCountSqrt * ViewCountSqrt;
 	const uint32_t NormalCount = NormalCountSqrt * NormalCountSqrt;
 	const uint32_t RoughnessCount = (uint32_t)Root.BakeRoughnessCount;
-	const uint32_t SphericalHarmonicCount = 33;
+	const uint32_t SphericalHarmonicCount = SHE_SPEC_COEFFS;
 
 	const D3D12_CPU_DESCRIPTOR_HANDLE TempSHESHCoeffUAV = AllocateDescriptors(Gfx, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
 	{
 		D3D12_UNORDERED_ACCESS_VIEW_DESC UAVDesc = {};
 		UAVDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-		UAVDesc.Buffer.NumElements = 34;
+		UAVDesc.Buffer.NumElements = SHE_LUT_STRIDE;
 		UAVDesc.Buffer.StructureByteStride = sizeof(XMFLOAT4);
 		UAVDesc.Format = DXGI_FORMAT_UNKNOWN;
 		Gfx.Device->CreateUnorderedAccessView(SHESHCoeff, nullptr, &UAVDesc, TempSHESHCoeffUAV);
@@ -1725,19 +1822,20 @@ static void SHEDiffuse(FDemoRoot &Root, FGraphicsContext &Gfx, ID3D12Resource *S
 	//            writes 9 float3 partials per group.
 	//   Stage 2: a single group sums all partials and writes the final
 	//            coefficients (with 4*pi/N normalization and Ramamoorthi
-	//            cosine-band convolution) into SHESHCoeff slots [34..42].
+	//            cosine-band convolution) into SHESHCoeff slots
+	//            [SHE_DIFFUSE_BASE .. SHE_DIFFUSE_BASE+8].
 	const uint32_t TotalSampleCount = 65536;
 	const uint32_t SamplesPerThread = 16;
 	const uint32_t ThreadCountX = Root.WaveSize; // group size == wave size
 	const uint32_t GroupCount = TotalSampleCount / (SamplesPerThread * ThreadCountX); // 128 (wave32) / 64 (wave64)
 
-	// Whole-buffer UAV over SHESHCoeff: the finalize pass writes slots [34..43]
-	// with absolute indices, leaving the specular coefficients [0..33] untouched.
+	// Whole-buffer UAV over SHESHCoeff: the finalize pass writes diffuse slots
+	// with absolute indices, leaving the specular/autoBias slots untouched.
 	const D3D12_CPU_DESCRIPTOR_HANDLE SHESHCoeffUAV = AllocateDescriptors(Gfx, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
 	{
 		D3D12_UNORDERED_ACCESS_VIEW_DESC UAVDesc = {};
 		UAVDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-		UAVDesc.Buffer.NumElements = 44;
+		UAVDesc.Buffer.NumElements = SHE_COEFF_BUFFER_SIZE;
 		UAVDesc.Buffer.StructureByteStride = sizeof(XMFLOAT4);
 		UAVDesc.Format = DXGI_FORMAT_UNKNOWN;
 		Gfx.Device->CreateUnorderedAccessView(SHESHCoeff, nullptr, &UAVDesc, SHESHCoeffUAV);
@@ -1844,12 +1942,12 @@ static void SHEDiffuse(FDemoRoot &Root, FGraphicsContext &Gfx, ID3D12Resource *S
 }
 
 // Create the persistently-mapped upload buffer that holds the per-roughness
-// grouped-fit coefficients (StructuredBuffer<float4>, flat [group*34 + i]).
+// grouped-fit coefficients (StructuredBuffer<float4>, flat [group*SHE_LUT_STRIDE + i]).
 static void CreateSHECoeffLUTResources(FDemoRoot &Root)
 {
 	FGraphicsContext &Gfx = Root.Gfx;
-	// Enough for the raw layout (G*34) or the PCA layout (34 + N*34 + G*N);
-	// both stay well under this capacity (max 34 + 16*34 + 16*16 = 834).
+	// Enough for the raw layout (G*S) or the PCA layout (S + N*S + G*N),
+	// with S=SHE_LUT_STRIDE; worst case 125 + 16*125 + 16*16 = 2321 < 4096.
 	const uint32_t NumFloat4 = GSHECoeffLUTMaxFloat4;
 	const UINT64 BufferSize = (UINT64)NumFloat4 * sizeof(float4);
 	const D3D12_RESOURCE_DESC Desc = CD3DX12_RESOURCE_DESC::Buffer(BufferSize);
@@ -1961,6 +2059,291 @@ static void ProjectEnvMapToSH(FDemoRoot &Root)
 	}
 }
 
+// SG IBL: create the persistently-mapped upload buffer holding the fitted
+// lobes. Layout (two float4 per lobe):
+//   [2*i]   = (mu.xyz, lambda)   axis (unit) + sharpness
+//   [2*i+1] = (a.rgb, unused)    RGB amplitude
+static void CreateSGLobeResources(FDemoRoot &Root)
+{
+	FGraphicsContext &Gfx = Root.Gfx;
+	const uint32_t NumFloat4 = 2 * SG_MAX_LOBES;
+	const UINT64 BufferSize = (UINT64)NumFloat4 * sizeof(float4);
+	const D3D12_RESOURCE_DESC Desc = CD3DX12_RESOURCE_DESC::Buffer(BufferSize);
+	VHR(Gfx.Device->CreateCommittedResource(
+		get_rvalue_ptr(CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD)), D3D12_HEAP_FLAG_NONE,
+		&Desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&Root.SGLobes)));
+	CD3DX12_RANGE ReadRange(0, 0);
+	VHR(Root.SGLobes->Map(0, &ReadRange, &Root.SGLobesMapped));
+	memset(Root.SGLobesMapped, 0, (size_t)BufferSize);
+
+	Root.SGLobesSRV = AllocateDescriptors(Gfx, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
+	D3D12_SHADER_RESOURCE_VIEW_DESC S = {};
+	S.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+	S.Format = DXGI_FORMAT_UNKNOWN;
+	S.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	S.Buffer.NumElements = NumFloat4;
+	S.Buffer.StructureByteStride = sizeof(float4);
+	Gfx.Device->CreateShaderResourceView(Root.SGLobes, &S, Root.SGLobesSRV);
+}
+
+// Fit the current HDR environment as a sum of isotropic Spherical Gaussians
+//   L(v) ~= sum_i a_i * exp(lambda_i * (dot(mu_i, v) - 1)).
+//
+// Two cooperating stages:
+//   (1) axes / sharpness: a von Mises-Fisher mixture EM on the luminance-
+//       weighted directional distribution. In FIXED mode the axes are pinned
+//       to a uniform Fibonacci sphere; in FREE mode they move to the radiance-
+//       weighted centroid. Sharpness comes from the resultant length via the
+//       Banerjee vMF concentration estimate.
+//   (2) RGB amplitudes: a small linear least-squares solve (Cholesky) of the
+//       normal equations sum_t W_t (L_t - sum_i a_i G_i(d_t))^2.
+//
+// Directions use the exact same world-space mapping as ProjectEnvMapToSH /
+// EquirectangularToCube.hlsl, so the fit lives in the same space in which the
+// forward shader evaluates SG lobes (world-space N and R).
+static void FitEnvMapToSG(FDemoRoot &Root)
+{
+	if (!Root.SGLobesMapped)
+	{
+		return;
+	}
+
+	int Width = 0, Height = 0;
+	stbi_set_flip_vertically_on_load(1);
+	float *HDR = stbi_loadf(GEnvironmentMapPaths[Root.EnvironmentMapIndex], &Width, &Height, nullptr, 3);
+	stbi_set_flip_vertically_on_load(0);
+	EA_ASSERT(HDR && Width > 0 && Height > 0);
+
+	const double PI_D = 3.14159265358979323846;
+	const double GoldenAngle = PI_D * (3.0 - sqrt(5.0));
+	const auto ClampD = [](double X, double Lo, double Hi) -> double
+	{ return X < Lo ? Lo : (X > Hi ? Hi : X); };
+
+	// Compact coarse sample set (<= 256x128) keeps slider changes interactive
+	// even for 4k HDRIs; solid-angle weighting keeps the integral consistent.
+	struct FSGSample
+	{
+		float Dir[3];
+		float L[3];
+		double W;    // solid angle (amplitude LSQ weight)
+		double LumW; // luminance * solid angle (EM weight)
+	};
+	const int Cols = Width < 256 ? Width : 256;
+	const int Rows = Height < 128 ? Height : 128;
+	eastl::vector<FSGSample> Samples;
+	Samples.reserve((size_t)Cols * Rows);
+	for (int iy = 0; iy < Rows; ++iy)
+	{
+		const double v = (iy + 0.5) / (double)Rows;
+		const double e = PI_D * (v - 0.5);
+		const double sinE = sin(e), cosE = cos(e);
+		const double dOmega = cosE * (2.0 * PI_D / Cols) * (PI_D / Rows);
+		for (int ix = 0; ix < Cols; ++ix)
+		{
+			const double u = (ix + 0.5) / (double)Cols;
+			const double phi = 2.0 * PI_D * (u - 0.5);
+			const int fx = Width > 1 ? (int)(u * Width) : 0;
+			const int fy = Height > 1 ? (int)(v * Height) : 0;
+			const float *Texel = HDR + (size_t)(fy * Width + fx) * 3;
+
+			FSGSample S;
+			S.Dir[0] = (float)(cosE * cos(phi));
+			S.Dir[1] = (float)sinE;
+			S.Dir[2] = (float)(cosE * sin(phi));
+			S.L[0] = Texel[0];
+			S.L[1] = Texel[1];
+			S.L[2] = Texel[2];
+			S.W = dOmega;
+			S.LumW = dOmega * (0.2126 * Texel[0] + 0.7152 * Texel[1] + 0.0722 * Texel[2]);
+			Samples.push_back(S);
+		}
+	}
+	stbi_image_free(HDR);
+
+	int N = Root.SGLobeCount;
+	if (N < 1) N = 1;
+	if (N > SG_MAX_LOBES) N = SG_MAX_LOBES;
+	const bool bFixedAxis = (Root.SGAxisMode == SG_FIT_FIXED_AXIS);
+
+	double Mu[SG_MAX_LOBES][3];
+	double Lambda[SG_MAX_LOBES];
+	double Mix[SG_MAX_LOBES];
+	double Amp[SG_MAX_LOBES][3];
+
+	// Initialize lobes on a uniform Fibonacci sphere (used as-is by FIXED mode,
+	// used as the starting point for FREE mode), with sharpness ~ lobe count.
+	for (int i = 0; i < SG_MAX_LOBES; ++i)
+	{
+		const double y = 1.0 - 2.0 * (i + 0.5) / (double)N;
+		const double r = sqrt(y < -1.0 || y > 1.0 ? 0.0 : 1.0 - y * y);
+		const double th = GoldenAngle * i;
+		Mu[i][0] = cos(th) * r;
+		Mu[i][1] = y;
+		Mu[i][2] = sin(th) * r;
+		Lambda[i] = ClampD((double)N, 1.0, 64.0);
+		Mix[i] = 1.0 / (double)N;
+		Amp[i][0] = Amp[i][1] = Amp[i][2] = 0.0;
+	}
+
+	// von Mises-Fisher mixture EM on luminance-weighted directions.
+	const int NumIters = bFixedAxis ? 8 : 24;
+	for (int It = 0; It < NumIters; ++It)
+	{
+		double AccW[SG_MAX_LOBES] = {};
+		double AccVec[SG_MAX_LOBES][3] = {};
+		for (const FSGSample &S : Samples)
+		{
+			double Resp[SG_MAX_LOBES];
+			double Sum = 0.0;
+			for (int i = 0; i < N; ++i)
+			{
+				const double Dot = Mu[i][0] * S.Dir[0] + Mu[i][1] * S.Dir[1] + Mu[i][2] * S.Dir[2];
+				const double E = Mix[i] * exp(Lambda[i] * (Dot - 1.0));
+				Resp[i] = E;
+				Sum += E;
+			}
+			if (Sum < 1e-30)
+			{
+				continue;
+			}
+			const double Inv = 1.0 / Sum;
+			for (int i = 0; i < N; ++i)
+			{
+				const double RW = Resp[i] * Inv * S.LumW;
+				AccW[i] += RW;
+				AccVec[i][0] += RW * S.Dir[0];
+				AccVec[i][1] += RW * S.Dir[1];
+				AccVec[i][2] += RW * S.Dir[2];
+			}
+		}
+
+		double TotalW = 0.0;
+		for (int i = 0; i < N; ++i) TotalW += AccW[i];
+		if (TotalW < 1e-30)
+		{
+			break;
+		}
+
+		for (int i = 0; i < N; ++i)
+		{
+			Mix[i] = AccW[i] / TotalW > 1e-6 ? AccW[i] / TotalW : 1e-6;
+			if (AccW[i] < 1e-12)
+			{
+				continue;
+			}
+
+			double R;
+			if (!bFixedAxis)
+			{
+				const double Len = sqrt(AccVec[i][0] * AccVec[i][0] + AccVec[i][1] * AccVec[i][1] + AccVec[i][2] * AccVec[i][2]);
+				if (Len > 1e-12)
+				{
+					Mu[i][0] = AccVec[i][0] / Len;
+					Mu[i][1] = AccVec[i][1] / Len;
+					Mu[i][2] = AccVec[i][2] / Len;
+				}
+				R = Len / AccW[i];
+			}
+			else
+			{
+				// Concentration measured about the fixed, uniform axis.
+				R = (AccVec[i][0] * Mu[i][0] + AccVec[i][1] * Mu[i][1] + AccVec[i][2] * Mu[i][2]) / AccW[i];
+			}
+			R = ClampD(R, 0.0, 0.98);
+			// Banerjee et al. (2005) vML concentration approximation.
+			const double Kappa = R * (3.0 - R * R) / (1.0 - R * R > 1e-4 ? 1.0 - R * R : 1e-4);
+			Lambda[i] = ClampD(Kappa, 1.0, 64.0);
+		}
+	}
+
+	// Linear least squares for RGB amplitudes: G_i(d) = exp(lambda_i*(dot(mu_i,d)-1)).
+	double Gram[SG_MAX_LOBES][SG_MAX_LOBES] = {};
+	double RHS[SG_MAX_LOBES][3] = {};
+	double Gb[SG_MAX_LOBES];
+	for (const FSGSample &S : Samples)
+	{
+		for (int i = 0; i < N; ++i)
+		{
+			const double Dot = Mu[i][0] * S.Dir[0] + Mu[i][1] * S.Dir[1] + Mu[i][2] * S.Dir[2];
+			Gb[i] = exp(Lambda[i] * (Dot - 1.0));
+		}
+		for (int i = 0; i < N; ++i)
+		{
+			for (int j = 0; j <= i; ++j)
+			{
+				Gram[i][j] += S.W * Gb[i] * Gb[j];
+			}
+			for (int c = 0; c < 3; ++c)
+			{
+				RHS[i][c] += S.W * Gb[i] * S.L[c];
+			}
+		}
+	}
+	for (int i = 0; i < N; ++i)
+	{
+		for (int j = i + 1; j < N; ++j)
+		{
+			Gram[i][j] = Gram[j][i];
+		}
+	}
+	double DiagSum = 0.0;
+	for (int i = 0; i < N; ++i) DiagSum += Gram[i][i];
+	const double Ridge = 1e-6 * (DiagSum / N) + 1e-9;
+	for (int i = 0; i < N; ++i) Gram[i][i] += Ridge;
+
+	// Cholesky: Gram = L * L^T.
+	double Chol[SG_MAX_LOBES][SG_MAX_LOBES] = {};
+	for (int i = 0; i < N; ++i)
+	{
+		for (int j = 0; j <= i; ++j)
+		{
+			double Sum = Gram[i][j];
+			for (int k = 0; k < j; ++k) Sum -= Chol[i][k] * Chol[j][k];
+			if (i == j)
+			{
+				Chol[i][j] = sqrt(Sum > 1e-12 ? Sum : 1e-12);
+			}
+			else
+			{
+				Chol[i][j] = Sum / (Chol[j][j] > 1e-12 ? Chol[j][j] : 1e-12);
+			}
+		}
+	}
+	for (int c = 0; c < 3; ++c)
+	{
+		double Y[SG_MAX_LOBES];
+		for (int i = 0; i < N; ++i)
+		{
+			double Sum = RHS[i][c];
+			for (int k = 0; k < i; ++k) Sum -= Chol[i][k] * Y[k];
+			Y[i] = Sum / Chol[i][i];
+		}
+		double X[SG_MAX_LOBES];
+		for (int i = N - 1; i >= 0; --i)
+		{
+			double Sum = Y[i];
+			for (int k = i + 1; k < N; ++k) Sum -= Chol[k][i] * X[k];
+			X[i] = Sum / Chol[i][i];
+		}
+		for (int i = 0; i < N; ++i) Amp[i][c] = X[i];
+	}
+
+	auto *Dst = (float4 *)Root.SGLobesMapped;
+	for (int i = 0; i < SG_MAX_LOBES; ++i)
+	{
+		if (i < N)
+		{
+			Dst[2 * i] = {(float)Mu[i][0], (float)Mu[i][1], (float)Mu[i][2], (float)Lambda[i]};
+			Dst[2 * i + 1] = {(float)Amp[i][0], (float)Amp[i][1], (float)Amp[i][2], 0.0f};
+		}
+		else
+		{
+			Dst[2 * i] = {0.0f, 0.0f, 1.0f, 1.0f};
+			Dst[2 * i + 1] = {0.0f, 0.0f, 0.0f, 0.0f};
+		}
+	}
+}
+
 // Jacobi eigen-decomposition of a symmetric n x n matrix (Numerical Recipes).
 // a[][] is overwritten; eigenvalues returned in d[], eigenvector j is the
 // j-th column of v[][] (v[i][j] = component i of eigenvector j).
@@ -2042,36 +2425,36 @@ static void JacobiEigen(double a[16][16], int n, double d[16], double v[16][16])
 }
 
 // Pack the persistently-mapped LUT buffer from the CPU coefficient table.
-//  - raw : [g*34 + i].rgb = group g, parameter i (33 coeffs + autoBias).
-//  - PCA : [0..33] mean, [34 + k*34 + i] basis k, [34+N*34 + g*N + k].x weight.
-// PCA uses the snapshot method: eigen-decompose the G x G group Gram matrix
-// (G <= 16 << 102 dimensions), keep the top-N eigenvectors by eigenvalue
-// (= captured variance / importance), build 102-d basis vectors and each
-// group weight vector. The shader reconstructs mean + sum_k w[k]*basis[k].
+//  - raw : [g*S + i].rgb = group g, parameter i (specular + autoBias), S = SHE_LUT_STRIDE.
+//  - PCA : [0..S-1] mean, [S + k*S + i] basis k, [S+N*S + g*N + k].x weight.
+// PCA uses the snapshot method: eigen-decompose the G x G group Gram matrix,
+// keep the top-N eigenvectors by eigenvalue, build (3*S)-d basis vectors and
+// each group weight vector. The shader reconstructs mean + sum_k w[k]*basis[k].
 static void UploadCoeffLUT(FDemoRoot &Root)
 {
 	FSHECoeffTable &T = Root.CoeffTable;
 	if (!T.Valid || !Root.SHECoeffLUTMapped) return;
 	float4 *LUT = (float4 *)Root.SHECoeffLUTMapped;
 	const int G = T.BakeRoughnessCount;
+	const int S = SHE_LUT_STRIDE;
 	memset(LUT, 0, sizeof(float4) * GSHECoeffLUTMaxFloat4);
 
 	if (!Root.bUsePCA)
 	{
 		for (int g = 0; g < G; ++g)
-			for (int i = 0; i < 34; ++i)
-				LUT[g * 34 + i] = XMFLOAT4(T.Coeff[g][i][0], T.Coeff[g][i][1], T.Coeff[g][i][2], 0.0f);
+			for (int i = 0; i < S; ++i)
+				LUT[g * S + i] = XMFLOAT4(T.Coeff[g][i][0], T.Coeff[g][i][1], T.Coeff[g][i][2], 0.0f);
 		Root.ActivePCABasisCount = 0;
 		Root.PCAExplainedVariance = 1.0f;
 		T.PCABasisCount = 0; // no PCA basis rows / PCA variance to show
 		return;
 	}
 
-	const int D = 34 * 3; // 102 dims per group.
-	float x[GSHECoeffLUTMaxGroups][102];
-	float mean[102] = {};
+	const int D = S * 3; // 3*S dims per group (specular + autoBias, RGB).
+	float x[GSHECoeffLUTMaxGroups][GSHEPCADimMax];
+	float mean[GSHEPCADimMax] = {};
 	for (int g = 0; g < G; ++g)
-		for (int i = 0; i < 34; ++i)
+		for (int i = 0; i < S; ++i)
 			for (int c = 0; c < 3; ++c)
 			{
 				const int d = i * 3 + c;
@@ -2079,7 +2462,7 @@ static void UploadCoeffLUT(FDemoRoot &Root)
 				mean[d] += x[g][d];
 			}
 	for (int d = 0; d < D; ++d) mean[d] /= (float)G;
-	float y[GSHECoeffLUTMaxGroups][102];
+	float y[GSHECoeffLUTMaxGroups][GSHEPCADimMax];
 	for (int g = 0; g < G; ++g)
 		for (int d = 0; d < D; ++d)
 			y[g][d] = x[g][d] - mean[d];
@@ -2118,30 +2501,30 @@ static void UploadCoeffLUT(FDemoRoot &Root)
 	Root.PCAExplainedVariance = totalVar > 1e-12 ? (float)(keptVar / totalVar) : 1.0f;
 	T.PCABasisCount = N;
 
-	for (int i = 0; i < 34; ++i) // mean
+	for (int i = 0; i < S; ++i) // mean
 		LUT[i] = XMFLOAT4(mean[i * 3 + 0], mean[i * 3 + 1], mean[i * 3 + 2], 0.0f);
 
 	// Reconstruct every group from the retained top-N basis (mean + sum w_k*basis_k)
 	// and mirror basis vectors into the coefficient table for the ImGui display.
-	float recon[GSHECoeffLUTMaxGroups][102];
+	float recon[GSHECoeffLUTMaxGroups][GSHEPCADimMax];
 	for (int g = 0; g < G; ++g)
 		for (int d = 0; d < D; ++d)
 			recon[g][d] = mean[d];
 
-	const int WeightBase = 34 + N * 34;
+	const int WeightBase = S + N * S;
 	for (int k = 0; k < N; ++k)
 	{
 		const int col = cols[k];
 		const double invSqrt = lam[k] > 1e-12 ? 1.0 / sqrt(lam[k]) : 0.0;
-		float basis[102] = {};
+		float basis[GSHEPCADimMax] = {};
 		for (int g = 0; g < G; ++g)
 		{
 			const double coef = eigVec[g][col] * invSqrt;
 			for (int d = 0; d < D; ++d) basis[d] += (float)(coef * y[g][d]);
 		}
-		for (int i = 0; i < 34; ++i)
+		for (int i = 0; i < S; ++i)
 		{
-			LUT[34 + k * 34 + i] = XMFLOAT4(basis[i * 3 + 0], basis[i * 3 + 1], basis[i * 3 + 2], 0.0f);
+			LUT[S + k * S + i] = XMFLOAT4(basis[i * 3 + 0], basis[i * 3 + 1], basis[i * 3 + 2], 0.0f);
 			for (int c = 0; c < 3; ++c)
 				T.PCABasisCoeff[k][i][c] = basis[i * 3 + c];
 		}
@@ -2157,19 +2540,21 @@ static void UploadCoeffLUT(FDemoRoot &Root)
 	}
 
 	// Per-band / total variance of each original group vs its PCA reconstruction.
-	// Only the 33 specular coefficients (band members) are included, matching
-	// the existing vs-ungrouped variance; autoBias (index 33) is excluded.
+	// Only the specular coefficients (band members) are included; autoBias is
+	// excluded. Band indices are derived from the shared P/Q band description.
 	for (int g = 0; g < G; ++g)
 	{
 		float TotalSum = 0.0f;
 		int TotalN = 0;
 		for (int b = 0; b < GCoeffBandCount; ++b)
 		{
+			int IdxBuf[GCoeffBandMaxMembers];
+			const int Cnt = SHEBandIndicesFill(b, IdxBuf);
 			float BandSum = 0.0f;
 			int BandN = 0;
-			for (int k = 0; k < GCoeffBandCoeffCount[b]; ++k)
+			for (int k = 0; k < Cnt; ++k)
 			{
-				const int Idx = GCoeffBandIndices[b][k];
+				const int Idx = IdxBuf[k];
 				for (int c = 0; c < 3; ++c)
 				{
 					const float diff = T.Coeff[g][Idx][c] - recon[g][Idx * 3 + c];
@@ -2185,8 +2570,9 @@ static void UploadCoeffLUT(FDemoRoot &Root)
 	}
 }
 
-// Read back the baked SHE matrices and solve a separate 33-coefficient fit for
-// each roughness group, plus one ungrouped (global) fit used as the baseline.
+// Read back the baked SHE matrices and solve a separate fit for the
+// SHE_SPEC_COEFFS specular slots for each roughness group, plus one
+// ungrouped (global) fit used as the baseline.
 // Results fill Root.CoeffTable and are uploaded into the LUT buffer.
 // Height row layout (SHE_Build.hlsl): height = NormalIndex + RoughnessIndex*64,
 // so group g owns rows [g*64, g*64+63].
@@ -2199,6 +2585,8 @@ static void ComputeGroupedSHEFit(FDemoRoot &Root)
 	FSHECoeffTable &Table = Root.CoeffTable;
 	memset(&Table, 0, sizeof(Table));
 	Table.BakeRoughnessCount = (int)RoughnessCount;
+	Table.POrder = Root.SHEPOrder;
+	Table.QOrder = Root.SHEQOrder;
 	Table.RoughnessStart = Root.BakeRoughnessStart;
 	Table.RoughnessEnd = Root.BakeRoughnessEnd;
 
@@ -2252,13 +2640,15 @@ static void ComputeGroupedSHEFit(FDemoRoot &Root)
 	const UINT bRowPitch = bFoot.Footprint.RowPitch;
 
 	// Global (ungrouped) normal-equation accumulators, summed across every row.
-	float GAtA[33][33] = {};
-	float GAtb[33][3] = {};
+	// All SHE_SPEC_COEFFS slots participate; unused P/Q slots have zero A
+	// columns and (with ridge) solve to exactly 0.
+	float GAtA[SHE_SPEC_COEFFS][SHE_SPEC_COEFFS] = {};
+	float GAtb[SHE_SPEC_COEFFS][3] = {};
 
 	for (uint32_t g = 0; g < RoughnessCount; ++g)
 	{
-		float AtA[33][33] = {};
-		float Atb[33][3] = {};
+		float AtA[SHE_SPEC_COEFFS][SHE_SPEC_COEFFS] = {};
+		float Atb[SHE_SPEC_COEFFS][3] = {};
 		for (uint32_t h = g * GSHENormalCount; h < (g + 1) * GSHENormalCount; ++h)
 		{
 			const float *ARow = (const float *)(ABase + (size_t)h * ARowPitch);
@@ -2271,7 +2661,7 @@ static void ComputeGroupedSHEFit(FDemoRoot &Root)
 				{
 					blog[c] = HalfToFloat(bRow[v * 4 + c]);
 				}
-				for (int i = 0; i < 33; ++i)
+				for (int i = 0; i < SHE_SPEC_COEFFS; ++i)
 				{
 					for (int j = 0; j <= i; ++j)
 					{
@@ -2288,12 +2678,12 @@ static void ComputeGroupedSHEFit(FDemoRoot &Root)
 				}
 			}
 		}
-		for (int i = 0; i < 33; ++i)
+		for (int i = 0; i < SHE_SPEC_COEFFS; ++i)
 		{
 			AtA[i][i] += 1e-2f; // ridge
 		}
-		float X[33][3] = {};
-		SolveGroupedFit(AtA, Atb, X);
+		float X[SHE_SPEC_COEFFS][3] = {};
+		SolveGroupedFit(AtA, Atb, X, SHE_SPEC_COEFFS);
 
 		// Per-group log-space energy calibration (autoBias), mirroring
 		// SHE_Calibrate.hlsl but restricted to this group's rows.
@@ -2308,7 +2698,7 @@ static void ComputeGroupedSHEFit(FDemoRoot &Root)
 				for (int c = 0; c < 3; ++c)
 				{
 					float LogRecon = 0.0f;
-					for (int i = 0; i < 33; ++i)
+					for (int i = 0; i < SHE_SPEC_COEFFS; ++i)
 					{
 						LogRecon += a[i] * X[i][c];
 					}
@@ -2317,7 +2707,7 @@ static void ComputeGroupedSHEFit(FDemoRoot &Root)
 				}
 			}
 		}
-		for (int i = 0; i < 33; ++i)
+		for (int i = 0; i < SHE_SPEC_COEFFS; ++i)
 		{
 			for (int c = 0; c < 3; ++c)
 			{
@@ -2326,17 +2716,17 @@ static void ComputeGroupedSHEFit(FDemoRoot &Root)
 		}
 		for (int c = 0; c < 3; ++c)
 		{
-			Table.Coeff[g][33][c] = logf(fmaxf(Target[c], 1e-6f) / fmaxf(Recon[c], 1e-6f));
+			Table.Coeff[g][SHE_AUTOBIAS_SLOT][c] = logf(fmaxf(Target[c], 1e-6f) / fmaxf(Recon[c], 1e-6f));
 		}
 	}
 
 	// Ungrouped baseline fit (last table row).
-	for (int i = 0; i < 33; ++i)
+	for (int i = 0; i < SHE_SPEC_COEFFS; ++i)
 	{
 		GAtA[i][i] += 1e-2f;
 	}
-	float GX[33][3] = {};
-	SolveGroupedFit(GAtA, GAtb, GX);
+	float GX[SHE_SPEC_COEFFS][3] = {};
+	SolveGroupedFit(GAtA, GAtb, GX, SHE_SPEC_COEFFS);
 	{
 		float Target[3] = {}, Recon[3] = {};
 		for (uint32_t h = 0; h < TotalHeight; ++h)
@@ -2349,7 +2739,7 @@ static void ComputeGroupedSHEFit(FDemoRoot &Root)
 				for (int c = 0; c < 3; ++c)
 				{
 					float LogRecon = 0.0f;
-					for (int i = 0; i < 33; ++i)
+					for (int i = 0; i < SHE_SPEC_COEFFS; ++i)
 					{
 						LogRecon += a[i] * GX[i][c];
 					}
@@ -2358,7 +2748,7 @@ static void ComputeGroupedSHEFit(FDemoRoot &Root)
 				}
 			}
 		}
-		for (int i = 0; i < 33; ++i)
+		for (int i = 0; i < SHE_SPEC_COEFFS; ++i)
 		{
 			for (int c = 0; c < 3; ++c)
 			{
@@ -2367,7 +2757,7 @@ static void ComputeGroupedSHEFit(FDemoRoot &Root)
 		}
 		for (int c = 0; c < 3; ++c)
 		{
-			Table.Coeff[RoughnessCount][33][c] = logf(fmaxf(Target[c], 1e-6f) / fmaxf(Recon[c], 1e-6f));
+			Table.Coeff[RoughnessCount][SHE_AUTOBIAS_SLOT][c] = logf(fmaxf(Target[c], 1e-6f) / fmaxf(Recon[c], 1e-6f));
 		}
 	}
 
@@ -2377,18 +2767,20 @@ static void ComputeGroupedSHEFit(FDemoRoot &Root)
 	SAFE_RELEASE(Readb);
 
 	// Mean squared deviation of each grouped row vs the ungrouped baseline,
-	// per band (over RGB) and over all 33 coefficients.
+	// per band (over RGB) and over all specular coefficients.
 	for (uint32_t g = 0; g < RoughnessCount; ++g)
 	{
 		float TotalSum = 0.0f;
 		int TotalN = 0;
 		for (int b = 0; b < GCoeffBandCount; ++b)
 		{
+			int IdxBuf[GCoeffBandMaxMembers];
+			const int Cnt = SHEBandIndicesFill(b, IdxBuf);
 			float BandSum = 0.0f;
 			int BandN = 0;
-			for (int k = 0; k < GCoeffBandCoeffCount[b]; ++k)
+			for (int k = 0; k < Cnt; ++k)
 			{
-				const int Idx = GCoeffBandIndices[b][k];
+				const int Idx = IdxBuf[k];
 				for (int c = 0; c < 3; ++c)
 				{
 					const float d = Table.Coeff[g][Idx][c] - Table.Coeff[RoughnessCount][Idx][c];
@@ -2412,11 +2804,11 @@ static void ComputeGroupedSHEFit(FDemoRoot &Root)
 	Root.NumFrames = 0;
 }
 
-// ImGui table: one row per roughness group (+ ungrouped baseline), 33 SHE
-// coefficients grouped by SH band, with per-band and total variance vs the
-// ungrouped fit. Uses ImGui 1.72 legacy Columns API.
+// ImGui table: one row per roughness group (+ ungrouped baseline), SHE
+// specular coefficients grouped by SH band, with per-band and total variance
+// vs the ungrouped fit. Uses ImGui 1.72 legacy Columns API.
 // ImGui table: one row per roughness group (+ ungrouped baseline + PCA basis),
-// 33 SHE coefficients grouped by SH band (2*l + 1 per band), with per-band and
+// specular coefficients grouped by SH band (2*l + 1 per band), with per-band and
 // total variance columns. Uses ImGui 1.72 legacy Columns API.
 static void DrawSHECoeffTable(FDemoRoot &Root)
 {
@@ -2436,13 +2828,13 @@ static void DrawSHECoeffTable(FDemoRoot &Root)
 	}
 	const int N = T.BakeRoughnessCount;
 	const bool bPCA = Root.bUsePCA && T.PCABasisCount > 0;
-	ImGui::Text("Groups: %d   Bake range: [%.2f, %.2f]", N, T.RoughnessStart, T.RoughnessEnd);
+	ImGui::Text("Groups: %d   Bake range: [%.2f, %.2f]   P=%d  Q=%d", N, T.RoughnessStart, T.RoughnessEnd, T.POrder, T.QOrder);
 	if (Root.bUsePCA)
 	{
 		ImGui::Text("PCA: %d / %d basis vectors, explained variance %.1f%%",
 			Root.ActivePCABasisCount, Root.PCABasisCount, Root.PCAExplainedVariance * 100.0f);
 	}
-	ImGui::TextDisabled("Cells: 33 coefficients (luma) per SH band (2l+1). vU= MSE vs Ungrouped, vP= MSE vs PCA recon.");
+	ImGui::TextDisabled("Cells: %d specular slots (luma) per SH band (2l+1). vU= MSE vs Ungrouped, vP= MSE vs PCA recon.", SHE_SPEC_COEFFS);
 
 	const int NumCols = 1 + GCoeffBandCount + 1;
 	ImGui::Columns(NumCols, "shecoefftable", true);
@@ -2477,11 +2869,13 @@ static void DrawSHECoeffTable(FDemoRoot &Root)
 	{
 		for (int b = 0; b < GCoeffBandCount; ++b)
 		{
+			int IdxBuf[GCoeffBandMaxMembers];
+			const int Cnt = SHEBandIndicesFill(b, IdxBuf);
 			char *p = Buf;
 			size_t Rem = sizeof(Buf);
-			for (int k = 0; k < GCoeffBandCoeffCount[b]; ++k)
+			for (int k = 0; k < Cnt; ++k)
 			{
-				const int Idx = GCoeffBandIndices[b][k];
+				const int Idx = IdxBuf[k];
 				const float Luma = (Coeff[Idx][0] + Coeff[Idx][1] + Coeff[Idx][2]) / 3.0f;
 				const int W = EA::StdC::Snprintf(p, Rem, "%.2f ", Luma);
 				if (W < 0 || (size_t)W >= Rem) break;
@@ -2650,6 +3044,10 @@ static void FinishEnvironmentPrecomputation(FDemoRoot &Root, eastl::vector<ID3D1
 	// This is a CPU-side integral over the equirectangular HDR, independent of
 	// the GPU bake above, so run it here where all environment state is settled.
 	ProjectEnvMapToSH(Root);
+
+	// Re-fit the SG lobes for the (possibly new) HDR with the current settings.
+	Root.SGDirty = 0;
+	FitEnvMapToSG(Root);
 }
 
 static void RebuildEnvironment(FDemoRoot &Root)
@@ -2941,6 +3339,7 @@ static void Initialize(FDemoRoot &Root)
 	CreatePipelines(Gfx, Root.NumSamples, Root.Pipelines, Root.RootSignatures, Root.WaveSize);
 	CreateSHECoeffLUTResources(Root);
 	CreateClassicSHCoeffResources(Root);
+	CreateSGLobeResources(Root);
 
 	eastl::vector<FVertex> AllVertices;
 	eastl::vector<uint32_t> AllIndices;
@@ -2956,7 +3355,7 @@ static void Initialize(FDemoRoot &Root)
 			Root.StaticMeshes.push_back(FStaticMesh{Mesh.Sections[0].IndexCount, Mesh.Sections[0].StartIndexLocation, Mesh.Sections[0].BaseVertexLocation});
 		}
 
-		const int32_t NumRows = 8;     // 4 IBL groups x 2 metallic rows.
+		const int32_t NumRows = 10;    // 5 IBL groups x 2 metallic rows.
 		const int32_t NumColumns = 11; // Roughness from RoughnessStart to 1.
 		const float CellSize = 2.2f;
 		for (int32_t RowIdx = 0; RowIdx < NumRows; ++RowIdx)
@@ -3123,6 +3522,11 @@ static void Shutdown(FDemoRoot &Root)
 		Root.ClassicSHCoeff->Unmap(0, nullptr);
 	}
 	SAFE_RELEASE(Root.ClassicSHCoeff);
+	if (Root.SGLobes)
+	{
+		Root.SGLobes->Unmap(0, nullptr);
+	}
+	SAFE_RELEASE(Root.SGLobes);
 	SAFE_RELEASE(Root.MSColorBuffer);
 	SAFE_RELEASE(Root.MSDepthBuffer);
 	SAFE_RELEASE(Root.AccumulationBuffer);
